@@ -166,7 +166,7 @@ def zscore_check(x, axis=None, thres= 1e-10, verbose=False):
             print(f"Signal is z-scored: mean is close to 0 and std is close to 1 (max|mean|={np.max(np.abs(mean)):.3e}); max|std-1|={np.max(np.abs(std-1)):.3e})")
         return True
 
-def lagged_fc_matrices(X: np.ndarray | jnp.ndarray, n_tau: int = 2, diag_zero: bool = True) -> np.ndarray:
+def lagged_fc_matrices(X: np.ndarray | jnp.ndarray, n_tau: int = 2, diag_zero: bool = True, z_score: bool = True) -> np.ndarray:
     """ Compute lagged functional connectivity matrices from time series data.
     
     Parameters
@@ -186,6 +186,9 @@ def lagged_fc_matrices(X: np.ndarray | jnp.ndarray, n_tau: int = 2, diag_zero: b
     # Transform to jax array for compatibility if input is numpy array
     if type(X) is np.ndarray:
         X = jnp.array(X)
+    # Optionally z-score the input time series if required
+    if z_score:
+        X = z_score_per_region(X)
     # Get dimensions
     n_T, n_nodes = X.shape
     # Lag (time-shifted) FC matrices
@@ -462,9 +465,13 @@ def compute_quality_metrics(t1, bold_TR, transient_lim, n_nodes, n_sub, n_cond,
     Q1_corr_pre = np.empty((n_sub, n_cond))
     Q1_rmse_pre = np.empty((n_sub, n_cond))
 
-    # Initialize simulated lagged FC matrices 
+    # Initialize simulated lagged FC matrices for correlation computation (zero diagonal)
     Q0_sim = np.empty((n_sub, n_nodes, n_nodes, n_cond))
     Q1_sim = np.empty((n_sub, n_nodes, n_nodes, n_cond))
+
+    # Initialize simulated lagged FC matrices for correlation computation (with diagonal)
+    Q0_sim_save = np.empty((n_sub, n_nodes, n_nodes, n_cond))
+    Q1_sim_save = np.empty((n_sub, n_nodes, n_nodes, n_cond))
 
     # Initialize variables to store post-optimization quality metrics for all participants and conditions
     Q0_corr_opt = np.empty((n_sub, n_cond))
@@ -568,6 +575,11 @@ def compute_quality_metrics(t1, bold_TR, transient_lim, n_nodes, n_sub, n_cond,
             plt.savefig(os.path.join(result_dir, f"gd_results_participant_{participant_idx}_condition_{conds[condition_idx]}.png"), dpi=300)
             plt.close(fig)
 
+            # Compute simulated lagged FC matrices to save as arrays (with diagonal)
+            Q_sim = lagged_fc_matrices(z_scored_gd[participant_idx, :, :, condition_idx], n_tau=2, diag_zero=False)
+            Q0_sim_save[participant_idx, :, :, condition_idx] = Q_sim[0]  # Simulated FC0
+            Q1_sim_save[participant_idx, :, :, condition_idx] = Q_sim[1]  # Simulated FC1
+
     # Save dataframe into csv file
     results_csv_path = os.path.join(result_dir, "optimization_quality_metrics.csv")
     results_df.to_csv(results_csv_path, index=False)
@@ -590,8 +602,8 @@ def compute_quality_metrics(t1, bold_TR, transient_lim, n_nodes, n_sub, n_cond,
     # Save simulated lagged FC matrices into .npy files
     Q0_sim_path = os.path.join(result_dir, "Q0_sim.npy")
     Q1_sim_path = os.path.join(result_dir, "Q1_sim.npy")
-    np.save(Q0_sim_path, Q0_sim)
-    np.save(Q1_sim_path, Q1_sim)
+    np.save(Q0_sim_path, Q0_sim_save)
+    np.save(Q1_sim_path, Q1_sim_save)
     if verbose:
         print(f"Simulated FC0 matrices saved to {Q0_sim_path}")
         print(f"Simulated FC1 matrices saved to {Q1_sim_path}")

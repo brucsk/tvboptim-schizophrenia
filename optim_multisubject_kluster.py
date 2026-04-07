@@ -57,10 +57,10 @@ for participant_idx in range(n_sub):
         X_emp = ts.T
     
         # Z-score the empirical time series per region
-        z_scored_emp = z_score_per_region(X_emp)
+        #z_scored_emp = z_score_per_region(X_emp)
 
         # Compute empirical lagged FC matrices
-        Q_emp_single = lagged_fc_matrices(z_scored_emp, n_tau=n_tau, diag_zero=True)
+        Q_emp_single = lagged_fc_matrices(X_emp, n_tau=n_tau, diag_zero=False, z_score=False)
         Q0_emp_single = Q_emp_single[0]  # FC0 (zero-lag)
         Q1_emp_single = Q_emp_single[1]  # FC1 (lag-1)
 
@@ -100,7 +100,7 @@ Q0_pre_gd, Q1_pre_gd = eval_Q0_Q1(
 
 ## Main pipeline ========================
 # Test for scaling up - later substitute with n_sub and n_cond defined at the beggining of script
-n_sub_test = 3
+n_sub_test = 1
 n_cond_test = 2
 
 # Define ranges for participants and conditions for testing
@@ -143,8 +143,9 @@ for participant_idx in participant_range_test:
         optimized_fits_test[participant_idx, condition_idx] = optimized_fit_temp
 
 ## Save results =====================
+
 # Create a folder in the results directory with the learning rate and max steps information
-run_dir = os.path.join(result_dir, f"learning_rate_{learning_rate}_max_steps_{max_steps}")
+run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_{n_sub_test}_sub_zscore_False_diagZero_False")
 os.makedirs(run_dir, exist_ok=True)
 
 # Save variables to a pickle file with a timestamp in the filename
