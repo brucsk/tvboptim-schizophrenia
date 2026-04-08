@@ -60,7 +60,7 @@ for participant_idx in range(n_sub):
         #z_scored_emp = z_score_per_region(X_emp)
 
         # Compute empirical lagged FC matrices
-        Q_emp_single = lagged_fc_matrices(X_emp, n_tau=n_tau, diag_zero=False, z_score=False)
+        Q_emp_single = lagged_fc_matrices(X_emp, n_tau=n_tau, diag_zero=False, diag_zero_Q0=True, z_score=True)
         Q0_emp_single = Q_emp_single[0]  # FC0 (zero-lag)
         Q1_emp_single = Q_emp_single[1]  # FC1 (lag-1)
 
@@ -75,7 +75,6 @@ print("Empirical FC1 shape (regions x regions):", Q1_emp_all.shape)
 sc_path = 'SC_EnigmadK68.mat'
 tl_path = 'tract_lengths.csv'
 centers_path = 'centers.txt'
-
 weights, delays, labels = load_structural_connectivity(sc_filepath=sc_path, tl_filepath=tl_path, centers_filepath=centers_path)
 
 ## Build model to optimize =====================
@@ -100,7 +99,7 @@ Q0_pre_gd, Q1_pre_gd = eval_Q0_Q1(
 
 ## Main pipeline ========================
 # Test for scaling up - later substitute with n_sub and n_cond defined at the beggining of script
-n_sub_test = 1
+n_sub_test = 3
 n_cond_test = 2
 
 # Define ranges for participants and conditions for testing

@@ -166,7 +166,7 @@ def zscore_check(x, axis=None, thres= 1e-10, verbose=False):
             print(f"Signal is z-scored: mean is close to 0 and std is close to 1 (max|mean|={np.max(np.abs(mean)):.3e}); max|std-1|={np.max(np.abs(std-1)):.3e})")
         return True
 
-def lagged_fc_matrices(X: np.ndarray | jnp.ndarray, n_tau: int = 2, diag_zero: bool = True, z_score: bool = True) -> np.ndarray:
+def lagged_fc_matrices(X: np.ndarray | jnp.ndarray, n_tau: int = 2, diag_zero: bool = True, diag_zero_Q0: bool = True, z_score: bool = True) -> np.ndarray:
     """ Compute lagged functional connectivity matrices from time series data.
     
     Parameters
@@ -177,6 +177,11 @@ def lagged_fc_matrices(X: np.ndarray | jnp.ndarray, n_tau: int = 2, diag_zero: b
         Number of time lags to compute (default is 2, which computes FC0 and FC1).
     diag_zero : bool
         Whether to set diagonal elements to zero (default is True).
+    diag_zero_Q0 : bool
+        Whether to set diagonal elements of Q0 to zero (default is True).
+    z_score : bool
+        Whether to z-score the input time series (default is True).
+
 
     Returns
     -------
@@ -209,6 +214,9 @@ def lagged_fc_matrices(X: np.ndarray | jnp.ndarray, n_tau: int = 2, diag_zero: b
 
     if diag_zero:
         Q = Q * (1.0 - jnp.eye(n_nodes)[None, :, :])
+
+    if diag_zero_Q0:
+        Q = Q.at[0].set(Q[0] * (1.0 - jnp.eye(n_nodes)))
 
     return Q
 
