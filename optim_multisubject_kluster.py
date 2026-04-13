@@ -99,7 +99,7 @@ Q0_pre_gd, Q1_pre_gd = eval_Q0_Q1(
 
 ## Main pipeline ========================
 # Test for scaling up - later substitute with n_sub and n_cond defined at the beggining of script
-n_sub_test = 3
+n_sub_test = 1
 n_cond_test = 2
 
 # Define ranges for participants and conditions for testing
@@ -144,7 +144,7 @@ for participant_idx in participant_range_test:
 ## Save results =====================
 
 # Create a folder in the results directory with the learning rate and max steps information
-run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_{n_sub_test}_sub_zscore_False_diagZero_False")
+run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_{n_sub_test}_sub_zscore_False_diagZero_False_corrected")
 os.makedirs(run_dir, exist_ok=True)
 
 # Save variables to a pickle file with a timestamp in the filename
