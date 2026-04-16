@@ -239,7 +239,7 @@ def make_loss(
         bold_signal = bold_signal[5:, :]
         z_scored_bold = z_score_per_region(bold_signal)
 
-        Qsim = lagged_fc_matrices(z_scored_bold, n_tau=2, diag_zero=False, diag_zero_Q0=True)
+        Qsim = lagged_fc_matrices(z_scored_bold, n_tau=2, diag_zero=False, diag_zero_Q0=False)
         Q0_sim, Q1_sim = Qsim[0], Qsim[1]
 
         loss_q0 = rmse(Q0_sim, Q0_emp)
@@ -357,7 +357,7 @@ def eval_Q0_Q1(model, state, bold_monitor):
                                           state=state, 
                                           bold_monitor=bold_monitor)
 
-    Q_sim = lagged_fc_matrices(z_scored_bold, n_tau=2, diag_zero=False, diag_zero_Q0=True)
+    Q_sim = lagged_fc_matrices(z_scored_bold, n_tau=2, diag_zero=False, diag_zero_Q0=False)
     Q0_sim = Q_sim[0]  # Extract FC0 (lag-0)
     Q1_sim = Q_sim[1]  # Extract FC1 (lag-1)
     
@@ -525,7 +525,7 @@ def compute_quality_metrics(t1, bold_TR, transient_lim, n_nodes, n_sub, n_cond,
             )
             
             # Compute simulated lagged FC matrices
-            Q_sim = lagged_fc_matrices(z_scored_gd[participant_idx, :, :, condition_idx], n_tau=2, diag_zero=False, diag_zero_Q0=True)
+            Q_sim = lagged_fc_matrices(z_scored_gd[participant_idx, :, :, condition_idx], n_tau=2, diag_zero=False, diag_zero_Q0=False)
             Q0_sim[participant_idx, :, :, condition_idx] = Q_sim[0]  # Simulated FC0
             Q1_sim[participant_idx, :, :, condition_idx] = Q_sim[1]  # Simulated FC1
 
@@ -584,7 +584,7 @@ def compute_quality_metrics(t1, bold_TR, transient_lim, n_nodes, n_sub, n_cond,
             plt.close(fig)
 
             # Compute simulated lagged FC matrices to save as arrays (with diagonal)
-            Q_sim = lagged_fc_matrices(z_scored_gd[participant_idx, :, :, condition_idx], n_tau=2, diag_zero=False)
+            Q_sim = lagged_fc_matrices(z_scored_gd[participant_idx, :, :, condition_idx], n_tau=2, diag_zero=False, diag_zero_Q0=False)
             Q0_sim_save[participant_idx, :, :, condition_idx] = Q_sim[0]  # Simulated FC0
             Q1_sim_save[participant_idx, :, :, condition_idx] = Q_sim[1]  # Simulated FC1
 

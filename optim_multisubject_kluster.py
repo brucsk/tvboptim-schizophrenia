@@ -60,7 +60,7 @@ for participant_idx in range(n_sub):
         #z_scored_emp = z_score_per_region(X_emp)
 
         # Compute empirical lagged FC matrices
-        Q_emp_single = lagged_fc_matrices(X_emp, n_tau=n_tau, diag_zero=False, diag_zero_Q0=True, z_score=True)
+        Q_emp_single = lagged_fc_matrices(X_emp, n_tau=n_tau, diag_zero=False, diag_zero_Q0=False, z_score=True)
         Q0_emp_single = Q_emp_single[0]  # FC0 (zero-lag)
         Q1_emp_single = Q_emp_single[1]  # FC1 (lag-1)
 
@@ -144,7 +144,7 @@ for participant_idx in participant_range_test:
 ## Save results =====================
 
 # Create a folder in the results directory with the learning rate and max steps information
-run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_{n_sub_test}_sub_zscore_False_diagZero_False_corrected")
+run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_{n_sub_test}_sub_zscore_True_diagZero_False_diagZeroQ0_False")
 os.makedirs(run_dir, exist_ok=True)
 
 # Save variables to a pickle file with a timestamp in the filename
