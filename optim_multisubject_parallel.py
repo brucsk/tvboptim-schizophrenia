@@ -1,15 +1,24 @@
+## CPU setup (before JAX import) ====================
+cpu = True
+if cpu:
+    N = 8
+    import os
+    os.environ['XLA_FLAGS'] = f'--xla_force_host_platform_device_count={N}'
+
 ## Imports ====================
 import cloudpickle as pickle
 from datetime import datetime
 import jax
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-import os
 from pathlib import Path
 
 from utils import *
 from model_definition.network_model_utils import *
 from tvboptim.types import Parameter, BoundedParameter
+from tvboptim.types.spaces import GridAxis, Space
+from tvboptim.execution import ParallelExecution
 
 jax.config.update("jax_enable_x64", True)
 
@@ -99,59 +108,105 @@ Q0_pre_gd, Q1_pre_gd = eval_Q0_Q1(
     model_eval, state_eval, bold_monitor_opt
 )
 
-## Main pipeline ========================
+## Parallelizable optimization function ========================
+def run_optimization_parallel(state):
+    """
+    Run gradient-based optimization for one target_fic value.
+
+    Returns a dictionary that can be saved directly for later metric computation.
+    """
+    optimized_states = np.empty((n_sub_test, n_cond_test), dtype=object)
+    optimized_fits = np.empty((n_sub_test, n_cond_test), dtype=object)
+    initial_losses = np.zeros((n_sub_test, n_cond_test))
+    final_losses = np.zeros((n_sub_test, n_cond_test))
+    
+    #target_fic_val = state['target_fic']
+
+    for participant_idx in range(n_sub_test):
+        for condition_idx in range(n_cond_test):
+            print(f"Testing participant {participant_idx}, condition {condition_idx}, target_fic={target_fic_val:.4f}")
+
+            Q0_emp = Q0_emp_all[participant_idx, :, :, condition_idx]
+            Q1_emp = Q1_emp_all[participant_idx, :, :, condition_idx]
+
+            print(f"Empirical FC0 shape: {Q0_emp.shape}, Empirical FC1 shape: {Q1_emp.shape}")
+
+            state_for_run = copy.deepcopy(state_opt)
+            loss = make_loss(
+                model_opt=model_opt,
+                bold_monitor_opt=bold_monitor_opt,
+                Q0_emp=Q0_emp,
+                Q1_emp=Q1_emp,
+                target_fic=target_fic_val,
+                alpha_fc0=1.0,
+                beta_fc1=2.0
+            )
+
+            # Evaluate initial loss
+            initial_loss = loss(state_for_run)
+            print(f"Initial loss: {initial_loss:.4f}")
+
+            # Mark parameters for optimization (J_i, wLRE, wFFI) with appropriate constraints
+            state_for_run.dynamics.J_i = Parameter(state_for_run.dynamics.J_i)
+            state_for_run.coupling.coupling.wLRE = BoundedParameter(jnp.ones((n_nodes, n_nodes)), low=0.0, high=jnp.inf)
+            state_for_run.coupling.coupling.wFFI = BoundedParameter(jnp.ones((n_nodes, n_nodes)), low=0.0, high=jnp.inf)
+
+            optimized_state_temp, optimized_fit_temp = run_gradient_optimization(max_steps, learning_rate, loss, state_for_run)
+            optimized_states[participant_idx, condition_idx] = optimized_state_temp
+            optimized_fits[participant_idx, condition_idx] = optimized_fit_temp
+            initial_losses[participant_idx, condition_idx] = initial_loss
+            final_losses[participant_idx, condition_idx] = optimized_fit_temp[-1]  # Store final loss
+    
+    # Return dictionary with array values only (for parallel execution compatibility)
+    return {
+        "target_fic": float(target_fic_val),
+        "optimized_states": optimized_states,
+        "optimized_fits": optimized_fits,
+        "initial_losses": initial_losses,
+        "final_losses": final_losses,
+    }
+
+
+## Main pipeline with parallelization ========================
 # Test for scaling up - later substitute with n_sub and n_cond defined at the beggining of script
 n_sub_test = 1
 n_cond_test = 2
 
 # Define ranges for participants and conditions for testing
-participant_range_test= range(n_sub_test)
+participant_range_test = range(n_sub_test)
 cond_range_test = range(n_cond_test)
 
+# Set up parallelization parameters
+# Define the range of target_fic values to parallelize over
+parallel_state = {
+    'target_fic': GridAxis(0, 1, 8)  # Range from 0 to 1 with 8 points
+}
+
+# Generate the parameter space
+space = Space(parallel_state, mode='product')
+
+# Create parallel executor with the optimization function
+parallel_executor = ParallelExecution(run_optimization_parallel, space, n_pmap=8)
+
+# Run the parallel optimization
+print("Starting parallel optimization...")
+all_results = parallel_executor.run()
+
+print(f"Completed parallel optimization with {len(all_results)} different target_fic values")
+
+# Extract and organize results
 optimized_states_test = np.empty((n_sub_test, n_cond_test), dtype=object)
 optimized_fits_test = np.empty((n_sub_test, n_cond_test), dtype=object)
-
-for participant_idx in participant_range_test:
-    for condition_idx in cond_range_test:
-        print(f"Testing participant {participant_idx}, condition {condition_idx}")
-
-        Q0_emp = Q0_emp_all[participant_idx, :, :, condition_idx]  # FC0 for the first participant and first condition
-        Q1_emp = Q1_emp_all[participant_idx, :, :, condition_idx]
-
-        print(f"Empirical FC0 shape: {Q0_emp.shape}, Empirical FC1 shape: {Q1_emp.shape}")
-
-        loss = make_loss(
-            model_opt=model_opt,
-            bold_monitor_opt=bold_monitor_opt,
-            Q0_emp=Q0_emp,
-            Q1_emp=Q1_emp,
-            target_fic=target_fic,
-            alpha_fc0=1.0,
-            beta_fc1=2.0
-        )
-
-        # Evaluate initial loss
-        initial_loss = loss(state_opt)
-        print(f"Initial loss: {initial_loss:.4f}")
-
-        # Mark parameters for optimization (J_i, wLRE, wFFI) with appropriate constraints
-        state_opt.dynamics.J_i = Parameter(state_opt.dynamics.J_i)
-        state_opt.coupling.coupling.wLRE = BoundedParameter(jnp.ones((n_nodes, n_nodes)), low=0.0, high=jnp.inf)
-        state_opt.coupling.coupling.wFFI = BoundedParameter(jnp.ones((n_nodes, n_nodes)), low=0.0, high=jnp.inf)
-
-        optimized_state_temp, optimized_fit_temp = run_gradient_optimization(max_steps, learning_rate, loss, state_opt)
-        optimized_states_test[participant_idx, condition_idx] = optimized_state_temp
-        optimized_fits_test[participant_idx, condition_idx] = optimized_fit_temp
 
 ## Save results =====================
 
 # Create a folder in the results directory with the learning rate and max steps information
-run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_nsub_{n_sub_test}_sigma_{sigma}_zscore_True_diagZero_False_diagZeroQ0_False")
+run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_nsub_{n_sub_test}_sigma_{sigma}_zscore_True_diagZero_False_diagZeroQ0_False_parallel")
 os.makedirs(run_dir, exist_ok=True)
 
 # Save variables to a pickle file with a timestamp in the filename
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-pikl_name = f"part2_saved_state_{timestamp}.pkl"
+pikl_name = f"part2_saved_state_parallel_{timestamp}.pkl"
 pikl_path = Path(os.path.join(run_dir, pikl_name))
 
 # Set variables to save in a dictionary
@@ -161,6 +216,7 @@ to_save = {
     "model_opt": model_opt,
     "optimized_states": optimized_states_test,
     "optimized_fits": optimized_fits_test,
+    "all_parallel_results": all_results,  # Include all parallel execution results
 }
 
 # Save the dictionary to a pickle file
@@ -172,5 +228,7 @@ print(f"Saved variables to {pikl_path.resolve()}")
 ## Compute and save quality metrics and plots =====================
 compute_quality_metrics(t1, bold_TR, transient_lim, n_nodes, n_sub_test, n_cond_test, 
                             Q0_emp_all, Q1_emp_all, Q0_pre_gd, Q1_pre_gd, 
-                            model_opt, optimized_states_test, optimized_fits_test,  bold_monitor_opt, 
+                            model_opt, optimized_states_test, optimized_fits_test, bold_monitor_opt, 
                             result_dir = run_dir, conds = ["CTR", "SCZ"], verbose=False)
+
+print(f"\nParallel optimization completed. Results saved to {run_dir}")
