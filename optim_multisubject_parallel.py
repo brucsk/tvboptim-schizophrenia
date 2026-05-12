@@ -7,6 +7,7 @@ if cpu:
 
 ## Imports ====================
 import cloudpickle as pickle
+import copy
 from datetime import datetime
 import jax
 import jax.numpy as jnp
@@ -119,8 +120,15 @@ def run_optimization_parallel(state):
     optimized_fits = np.empty((n_sub_test, n_cond_test), dtype=object)
     initial_losses = np.zeros((n_sub_test, n_cond_test))
     final_losses = np.zeros((n_sub_test, n_cond_test))
-    
-    #target_fic_val = state['target_fic']
+
+    # arrays to collect BOLD and simulated FC per participant/condition
+    n_timepoints = int(t1 / bold_TR) - transient_lim
+    bold_gd = np.zeros((n_sub_test, n_timepoints, n_nodes, n_cond_test))
+    z_scored_gd = np.zeros((n_sub_test, n_timepoints, n_nodes, n_cond_test))
+    Q0_sim_save = np.zeros((n_sub_test, n_nodes, n_nodes, n_cond_test))
+    Q1_sim_save = np.zeros((n_sub_test, n_nodes, n_nodes, n_cond_test))
+
+    target_fic_val = state['target_fic']
 
     for participant_idx in range(n_sub_test):
         for condition_idx in range(n_cond_test):
@@ -156,14 +164,28 @@ def run_optimization_parallel(state):
             optimized_fits[participant_idx, condition_idx] = optimized_fit_temp
             initial_losses[participant_idx, condition_idx] = initial_loss
             final_losses[participant_idx, condition_idx] = optimized_fit_temp[-1]  # Store final loss
+
+            # Compute and store BOLD and simulated FC using the optimized state
+            bold_arr = compute_bold_time_series(model_opt, optimized_state_temp, bold_monitor_opt)
+            zbold_arr = compute_z_scored_bold(model_opt, optimized_state_temp, bold_monitor_opt)
+
+            # Ensure shapes match expected n_timepoints x n_nodes
+            bold_gd[participant_idx, : bold_arr.shape[0], :, condition_idx] = np.array(bold_arr)
+            z_scored_gd[participant_idx, : zbold_arr.shape[0], :, condition_idx] = np.array(zbold_arr)
+
+            Q_sim = lagged_fc_matrices(zbold_arr, n_tau=2, diag_zero=False, diag_zero_Q0=False)
+            Q0_sim_save[participant_idx, :, :, condition_idx] = np.array(Q_sim[0])
+            Q1_sim_save[participant_idx, :, :, condition_idx] = np.array(Q_sim[1])
     
     # Return dictionary with array values only (for parallel execution compatibility)
     return {
         "target_fic": float(target_fic_val),
-        "optimized_states": optimized_states,
-        "optimized_fits": optimized_fits,
         "initial_losses": initial_losses,
         "final_losses": final_losses,
+        "bold_gd": bold_gd,
+        "z_scored_gd": z_scored_gd,
+        "Q0_sim": Q0_sim_save,
+        "Q1_sim": Q1_sim_save,
     }
 
 
@@ -226,9 +248,9 @@ with pikl_path.open("wb") as f:
 print(f"Saved variables to {pikl_path.resolve()}")
 
 ## Compute and save quality metrics and plots =====================
-compute_quality_metrics(t1, bold_TR, transient_lim, n_nodes, n_sub_test, n_cond_test, 
-                            Q0_emp_all, Q1_emp_all, Q0_pre_gd, Q1_pre_gd, 
-                            model_opt, optimized_states_test, optimized_fits_test, bold_monitor_opt, 
-                            result_dir = run_dir, conds = ["CTR", "SCZ"], verbose=False)
+#compute_quality_metrics(t1, bold_TR, transient_lim, n_nodes, n_sub_test, n_cond_test, 
+                  #          Q0_emp_all, Q1_emp_all, Q0_pre_gd, Q1_pre_gd, 
+                   #         model_opt, optimized_states_test, optimized_fits_test, bold_monitor_opt, 
+                    #        result_dir = run_dir, conds = ["CTR", "SCZ"], verbose=False)
 
-print(f"\nParallel optimization completed. Results saved to {run_dir}")
+#print(f"\nParallel optimization completed. Results saved to {run_dir}")
