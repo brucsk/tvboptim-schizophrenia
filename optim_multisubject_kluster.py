@@ -29,10 +29,10 @@ n_cond = len(conds) # number of conditions
 
 # Simulation parameters
 t1 = 314_000   # Simulation duration (ms) matching empirical data (=304_000) + transient time (~10_000 ms)
-dt = 4.0      # Integration timestep (ms) matching original script
+dt = 4.0       # Integration timestep (ms) matching original script
 bold_TR = 2000.0 # BOLD sampling period (ms)
 transient_lim = 5 # Number of time points to remove as transient (transient_lim * dt ms)
-target_fic = 0.25  # FIC tuning parameter: Target excitatory activity level
+target_fic = 0.25  # FIC tuning parameter: Target excitatory activity level (default 0.25)
 
 # Gradient descent parameters
 learning_rate = 0.0325
@@ -78,8 +78,11 @@ centers_path = 'centers.txt'
 weights, delays, labels = load_structural_connectivity(sc_filepath=sc_path, tl_filepath=tl_path, centers_filepath=centers_path)
 
 ## Build model to optimize =====================
+# Test: vary the noise level sigma (default: 0.01)
+sigma = 0.01
+
 # Build a single network model using the structural connectivity and region labels
-network = build_network_model(weights=weights, labels=labels)
+network = build_network_model(weights=weights, labels=labels, sigma=sigma)
 
 ## Run initial simulation and set up BOLD monitor ======================
 model, state, result_init = run_initial_simulation(t1=t1, dt=dt, network=network)
@@ -99,7 +102,7 @@ Q0_pre_gd, Q1_pre_gd = eval_Q0_Q1(
 
 ## Main pipeline ========================
 # Test for scaling up - later substitute with n_sub and n_cond defined at the beggining of script
-n_sub_test = 1
+n_sub_test = 48
 n_cond_test = 2
 
 # Define ranges for participants and conditions for testing
@@ -144,7 +147,7 @@ for participant_idx in participant_range_test:
 ## Save results =====================
 
 # Create a folder in the results directory with the learning rate and max steps information
-run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_{n_sub_test}_sub_zscore_True_diagZero_False_diagZeroQ0_False")
+run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_sub_{n_sub_test}_sigma_{sigma}_zscore_T_diagZero_F_diagZeroQ0_F")
 os.makedirs(run_dir, exist_ok=True)
 
 # Save variables to a pickle file with a timestamp in the filename
