@@ -22,10 +22,13 @@ coverage.xml
 # Environments
 .env
 .venv
+.venv_*
 env/
 venv/
+venv_jax_new/
 ENV/
 .venv/
+.venv_jax_new/
 env.bak/
 venv.bak/
 .pytest_cache
@@ -69,3 +72,16 @@ docs/_styles-quartodoc.css
 .DS_Store?
 ._*
 Thumbs.db
+
+# Images or table results
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.csv
+*.txt
+
+# Saved variables
+*.pkl
+*.npy
