@@ -7,4 +7,5 @@
 # Extra dependencies 
 scipy
 joblib
+cloudpickle
 

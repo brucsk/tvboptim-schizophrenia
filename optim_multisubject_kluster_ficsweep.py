@@ -29,14 +29,18 @@ n_cond = len(conds) # number of conditions
 
 # Simulation parameters
 t1 = 314_000   # Simulation duration (ms) matching empirical data (=304_000) + transient time (~10_000 ms)
+# t1 = 50_000
 dt = 4.0      # Integration timestep (ms) matching original script
 bold_TR = 2000.0 # BOLD sampling period (ms)
 transient_lim = 5 # Number of time points to remove as transient (transient_lim * dt ms)
-target_fic = 0.25  # FIC tuning parameter: Target excitatory activity level
+
+target_fics = np.linspace(0.,1.,8) # np.linspace(0.,1.,3)  # FIC tuning parameter: Target excitatory activity level
+# target_fics = np.linspace(0.,1.,2) 
 
 # Gradient descent parameters
 learning_rate = 0.0325
 max_steps = 300
+# max_steps = 5
 
 # Other parameters
 n_tau = 2 # number of lags for lagged FC
@@ -60,7 +64,7 @@ for participant_idx in range(n_sub):
         #z_scored_emp = z_score_per_region(X_emp)
 
         # Compute empirical lagged FC matrices
-        Q_emp_single = lagged_fc_matrices(X_emp, n_tau=n_tau, diag_zero=False, diag_zero_Q0=False, z_score=True)
+        Q_emp_single = lagged_fc_matrices(X_emp, n_tau=n_tau, diag_zero=False, diag_zero_Q0=True, z_score=True)
         Q0_emp_single = Q_emp_single[0]  # FC0 (zero-lag)
         Q1_emp_single = Q_emp_single[1]  # FC1 (lag-1)
 
@@ -100,7 +104,7 @@ Q0_pre_gd, Q1_pre_gd = eval_Q0_Q1(
 )
 
 ## Main pipeline ========================
-# Test for scaling up - later substitute with n_sub and n_cond defined at the beggining of script
+# Test for scaling up - later substitute with n_sub and n_cond defined at the beginning of script
 n_sub_test = 1
 n_cond_test = 2
 
@@ -108,45 +112,52 @@ n_cond_test = 2
 participant_range_test= range(n_sub_test)
 cond_range_test = range(n_cond_test)
 
-optimized_states_test = np.empty((n_sub_test, n_cond_test), dtype=object)
-optimized_fits_test = np.empty((n_sub_test, n_cond_test), dtype=object)
+optimized_states_test = {}
+optimized_fits_test = {}
 
-for participant_idx in participant_range_test:
-    for condition_idx in cond_range_test:
-        print(f"Testing participant {participant_idx}, condition {condition_idx}")
+for target_fic in target_fics:
+    print(f'target_fic {target_fic}')
 
-        Q0_emp = Q0_emp_all[participant_idx, :, :, condition_idx]  # FC0 for the first participant and first condition
-        Q1_emp = Q1_emp_all[participant_idx, :, :, condition_idx]
+    # Initializing arrays to store states and fits per target_fic value
+    optimized_states_test[target_fic] = np.empty((n_sub_test, n_cond_test), dtype=object)
+    optimized_fits_test[target_fic] = np.empty((n_sub_test, n_cond_test), dtype=object)
 
-        print(f"Empirical FC0 shape: {Q0_emp.shape}, Empirical FC1 shape: {Q1_emp.shape}")
+    for participant_idx in participant_range_test:
+        for condition_idx in cond_range_test:
+            print(f"Testing participant {participant_idx}, condition {condition_idx}")
 
-        loss = make_loss(
-            model_opt=model_opt,
-            bold_monitor_opt=bold_monitor_opt,
-            Q0_emp=Q0_emp,
-            Q1_emp=Q1_emp,
-            target_fic=target_fic,
-            alpha_fc0=1.0,
-            beta_fc1=2.0
-        )
+            Q0_emp = Q0_emp_all[participant_idx, :, :, condition_idx]  # FC0 for the first participant and first condition
+            Q1_emp = Q1_emp_all[participant_idx, :, :, condition_idx]
 
-        # Evaluate initial loss
-        initial_loss = loss(state_opt)
-        print(f"Initial loss: {initial_loss:.4f}")
+            print(f"Empirical FC0 shape: {Q0_emp.shape}, Empirical FC1 shape: {Q1_emp.shape}")
 
-        # Mark parameters for optimization (J_i, wLRE, wFFI) with appropriate constraints
-        state_opt.dynamics.J_i = Parameter(state_opt.dynamics.J_i)
-        state_opt.coupling.coupling.wLRE = BoundedParameter(jnp.ones((n_nodes, n_nodes)), low=0.0, high=jnp.inf)
-        state_opt.coupling.coupling.wFFI = BoundedParameter(jnp.ones((n_nodes, n_nodes)), low=0.0, high=jnp.inf)
+            loss = make_loss(
+                model_opt=model_opt,
+                bold_monitor_opt=bold_monitor_opt,
+                Q0_emp=Q0_emp,
+                Q1_emp=Q1_emp,
+                target_fic=target_fic,
+                alpha_fc0=1.0,
+                beta_fc1=2.0
+            )
 
-        optimized_state_temp, optimized_fit_temp = run_gradient_optimization(max_steps, learning_rate, loss, state_opt)
-        optimized_states_test[participant_idx, condition_idx] = optimized_state_temp
-        optimized_fits_test[participant_idx, condition_idx] = optimized_fit_temp
+            # Evaluate initial loss
+            initial_loss = loss(state_opt)
+            print(f"Initial loss: {initial_loss:.4f}")
+
+            # Mark parameters for optimization (J_i, wLRE, wFFI) with appropriate constraints
+            state_opt.dynamics.J_i = Parameter(state_opt.dynamics.J_i)
+            state_opt.coupling.coupling.wLRE = BoundedParameter(jnp.ones((n_nodes, n_nodes)), low=0.0, high=jnp.inf)
+            state_opt.coupling.coupling.wFFI = BoundedParameter(jnp.ones((n_nodes, n_nodes)), low=0.0, high=jnp.inf)
+
+            optimized_state_temp, optimized_fit_temp = run_gradient_optimization(max_steps, learning_rate, loss, state_opt)
+            optimized_states_test[target_fic][participant_idx, condition_idx] = optimized_state_temp
+            optimized_fits_test[target_fic][participant_idx, condition_idx] = optimized_fit_temp
 
 ## Save results =====================
 
 # Create a folder in the results directory with the learning rate and max steps information
-run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_nsub_{n_sub_test}_sigma_{sigma}_zscore_True_diagZero_False_diagZeroQ0_False")
+run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_nsub_{n_sub_test}_sigma_{sigma}_zscore_True_diagZero_False_diagZeroQ0_False_ficsweep")
 os.makedirs(run_dir, exist_ok=True)
 
 # Save variables to a pickle file with a timestamp in the filename
@@ -156,6 +167,7 @@ pikl_path = Path(os.path.join(run_dir, pikl_name))
 
 # Set variables to save in a dictionary
 to_save = {
+    "target_fics":target_fics,
     "model_eval": model_eval,
     "state_eval": state_eval,
     "model_opt": model_opt,
@@ -170,7 +182,21 @@ with pikl_path.open("wb") as f:
 print(f"Saved variables to {pikl_path.resolve()}")
 
 ## Compute and save quality metrics and plots =====================
-compute_quality_metrics(t1, bold_TR, transient_lim, n_nodes, n_sub_test, n_cond_test, 
-                            Q0_emp_all, Q1_emp_all, Q0_pre_gd, Q1_pre_gd, 
-                            model_opt, optimized_states_test, optimized_fits_test,  bold_monitor_opt, 
-                            result_dir = run_dir, conds = ["CTR", "SCZ"], verbose=False)
+# compute_quality_metrics(t1, bold_TR, transient_lim, n_nodes, n_sub_test, n_cond_test, 
+#                             Q0_emp_all, Q1_emp_all, Q0_pre_gd, Q1_pre_gd, 
+#                             model_opt, optimized_states_test, optimized_fits_test,  bold_monitor_opt, 
+#                             result_dir = run_dir, conds = ["CTR", "SCZ"], verbose=False)
+
+for fic_key_temp in target_fics:
+    print(f"Computing quality metrics for fic_key_temp: {fic_key_temp}")
+    
+    run_dir_temp = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_nsub_{n_sub_test}_sigma_{sigma}_fic_{fic_key_temp}")
+    
+    os.makedirs(run_dir_temp, exist_ok=True)
+
+    compute_quality_metrics(
+        t1, bold_TR, transient_lim, n_nodes, n_sub_test, n_cond_test,
+        Q0_emp_all, Q1_emp_all, Q0_pre_gd, Q1_pre_gd,
+        model_opt, optimized_states_test[fic_key_temp], optimized_fits_test[fic_key_temp], bold_monitor_opt,
+        result_dir=run_dir_temp, conds=conds, verbose=False)
+
