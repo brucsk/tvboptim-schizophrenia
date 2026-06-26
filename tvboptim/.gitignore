@@ -22,13 +22,9 @@ coverage.xml
 # Environments
 .env
 .venv
-.venv_*
 env/
 venv/
-venv_jax_new/
 ENV/
-.venv/
-.venv_jax_new/
 env.bak/
 venv.bak/
 .pytest_cache
@@ -44,6 +40,7 @@ uv.lock
 
 # Custom
 /notebooks
+/data
 /examples
 
 # Quarto documentation
@@ -72,19 +69,5 @@ docs/_styles-quartodoc.css
 ._*
 Thumbs.db
 
-# Images or table results
-*.png
-*.jpg
-*.jpeg
-*.svg
-*.pdf
-*.csv
-*.txt
-
-# Saved variables
-*.pkl
-*.npy
-*.7z
-
-*.yml
-*.sh
+# AI Skills
+src/tvboptim/claude/skills
