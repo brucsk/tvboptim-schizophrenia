@@ -12,7 +12,7 @@ from tvboptim.experimental.network_dynamics.result import NativeSolution
 from tvboptim.experimental.network_dynamics.core.bunch import Bunch
 
 
-from tvboptim.observations.tvb_monitors.bold import Bold
+from tvboptim.observations.tvb_monitors.bold import Bold, HRFBold, HRFKernel, FirstOrderVolterraHRFKernel, GammaHRFKernel, DoubleExponentialHRFKernel, MixtureOfGammasHRFKernel
 
 def build_network_model(weights: np.ndarray, labels: list[str], sigma: float = 0.01, verbose: bool = True) -> Network:  
     """
@@ -87,22 +87,29 @@ def run_initial_simulation(t1: float, dt: float, network: Network, verbose: bool
 
     return model, state, result_init
 
-def setup_bold_monitor(bold_TR: float = 2000.0, result_init: NativeSolution = None, verbose: bool = True) -> Bold:
+def setup_bold_monitor(bold_TR: float = 2000.0, result_init: NativeSolution = None, 
+                       kernel: HRFKernel = FirstOrderVolterraHRFKernel(), verbose: bool = True) -> HRFBold:
     """
     Set up a BOLD monitor for the network simulation.
     Parameters
     ----------
     TR (float): Repetition time for BOLD sampling (ms).
     n_nodes (int): Number of nodes in the network.
+    result_init (NativeSolution): Initial simulation results to use as warm start for BOLD history.
+    kernel (HRFKernel): The hemodynamic response function kernel to use for BOLD simulation.
+    verbose (bool): Whether to print verbose output.
+
     Returns
     -------
+    HRFBold: A configured BOLD monitor for the network simulation.
     """    
     # The BOLD period is bold_TR
-    bold_monitor = Bold(
+    bold_monitor = HRFBold(
         period=bold_TR,           # BOLD sampling period (TR = 2000 ms)
         downsample_period=4.0,  # Intermediate downsampling matches dt
         voi=0,                  # Monitor first state variable (S_e)
-        history=result_init     # Use initial state as warm start for BOLD history
+        history=result_init,     # Use initial state as warm start for BOLD history
+        kernel=kernel 
     )
 
     if verbose:

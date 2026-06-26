@@ -118,6 +118,44 @@ def load_structural_connectivity(sc_filepath: str | None = None,
     
     return weights, delays, labels
 
+def load_structural_connectivity_AAL90(sc_files_path: str | None = None) -> tuple[np.ndarray, pd.DataFrame, list]:
+    """
+    Load the structural connectivity matrix from a .npy file.
+    
+    Parameters
+    ----------
+    sc_files_path (str | None): Filepath for all structural connectivity files (weights, tract lengths, region centers).
+
+    Returns
+    -------
+    tuple[np.ndarray, pd.DataFrame, list]: A tuple containing the normalized structural connectivity matrix, tract lengths DataFrame, and region labels.
+    """
+    if sc_files_path is None:
+        raise ValueError("The path for structural connectivity files must be provided.")
+    
+    # Weights
+    SCR = np.loadtxt(os.path.join(sc_files_path, "weights.txt"))
+    weights = SCR / np.max(SCR)
+
+    # Delays
+    lengths = pd.read_csv(os.path.join(sc_files_path, "tract_lengths.txt"), sep=" ", header=None)
+    speed = 3.0
+    delays = lengths / speed
+
+    # Load region labels and coordinates
+    df = pd.read_csv(
+        os.path.join(sc_files_path, "centers.txt"),
+        sep='\t',
+        header=None,
+        dtype={1: float, 2: float, 3: float},
+        names=['label', 'x', 'y', 'z']
+    )
+
+    labels = df['label'].tolist()
+    
+    return weights, delays, labels
+
+
 def z_score_per_region(bold_signal: np.ndarray | jnp.ndarray) -> jnp.ndarray:
     """
     Z-score the BOLD signal for each region independently.
