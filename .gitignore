@@ -88,3 +88,10 @@ Thumbs.db
 
 *.yml
 *.sh
+
+# Include specific data files 
+!data/
+!data/connectivity_AAL90/
+!data/connectivity_AAL90/*.txt
+!data/processed_AAL90/
+!data/processed_AAL90/*.npy

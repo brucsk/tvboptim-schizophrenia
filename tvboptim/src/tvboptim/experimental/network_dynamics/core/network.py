@@ -94,7 +94,7 @@ class Network:
         self.noise = noise
 
         # Normalize coupling input to dict format with validation
-        self.couplings = self._normalize_couplings(coupling, dynamics)
+        self.coupling = self._normalize_couplings(coupling, dynamics)
 
         # Normalize external input to dict format with validation
 
@@ -244,37 +244,39 @@ class Network:
     def update_history(self, solution: Optional[NativeSolution]) -> None:
         """Update internal history from a simulation result.
 
-        Validates that the solution matches network configuration:
-        - n_states must match dynamics.STATE_VARIABLES
-        - n_nodes must match graph.n_nodes
-        - Warns if time coverage < max_delay (will be padded in get_history)
+        Slices ``solution.ys`` down to the integrated state variables (by name,
+        using ``solution.variable_names``) so delay lookups and ``initial_state``
+        see ``[n_time, len(STATE_NAMES), n_nodes]`` regardless of the dynamics'
+        VARIABLES_OF_INTEREST. Also warns if time coverage < max_delay.
 
         Args:
-            solution: NativeSolution from a previous simulation, or None to clear history
+            solution: Solution from a previous simulation, or None to clear history.
+                Must carry ``variable_names`` — all solve() paths populate this.
 
         Raises:
-            ValueError: If solution shape doesn't match network configuration
+            ValueError: If the solution shape is not 3D, lacks ``variable_names``,
+                is missing any entry of ``dynamics.STATE_NAMES``, or has an
+                n_nodes mismatch with the graph.
         """
         if solution is None:
             self._history = None
             return
 
-        # Validate shape
         if solution.ys.ndim != 3:
             raise ValueError(
-                f"History must be 3D [n_time, n_states, n_nodes], "
+                f"History must be 3D [n_time, n_variables, n_nodes], "
                 f"got shape {solution.ys.shape}"
             )
 
-        n_states = len(self.dynamics.STATE_NAMES)
+        state_names = tuple(self.dynamics.STATE_NAMES)
         n_nodes = self.graph.n_nodes
-        _, hist_states, hist_nodes = solution.ys.shape
+        _, hist_vars, hist_nodes = solution.ys.shape
+        variable_names = solution.variable_names
 
-        # Error on state/node mismatch
-        if hist_states != n_states:
+        if variable_names is None:
             raise ValueError(
-                f"History has {hist_states} states but network expects {n_states} "
-                f"(STATE_NAMES: {self.dynamics.STATE_NAMES})"
+                "Cannot update history: solution.variable_names is None. "
+                "Construct the solution via solve() or pass variable_names explicitly."
             )
 
         if hist_nodes != n_nodes:
@@ -282,7 +284,21 @@ class Network:
                 f"History has {hist_nodes} nodes but network has {n_nodes} nodes"
             )
 
-        # Warn if insufficient time coverage
+        if hist_vars != len(variable_names):
+            raise ValueError(
+                f"History axis 1 has {hist_vars} entries but variable_names "
+                f"has {len(variable_names)}: {variable_names}"
+            )
+
+        missing = [name for name in state_names if name not in variable_names]
+        if missing:
+            raise ValueError(
+                f"Cannot update history: solution is missing state variables "
+                f"{missing}. Recorded variables: {variable_names}. "
+                f"Include all STATE_NAMES {state_names} in the dynamics' "
+                f"VARIABLES_OF_INTEREST before running the simulation."
+            )
+
         if self.max_delay > 0.0:
             time_coverage = solution.ts[-1] - solution.ts[0]
             if time_coverage < self.max_delay:
@@ -292,7 +308,15 @@ class Network:
                     UserWarning,
                 )
 
-        self._history = solution
+        state_cols = [variable_names.index(name) for name in state_names]
+        sliced_ys = solution.ys[:, jnp.array(state_cols, dtype=int), :]
+
+        self._history = NativeSolution(
+            ts=solution.ts,
+            ys=sliced_ys,
+            dt=getattr(solution, "dt", None),
+            variable_names=state_names,
+        )
 
     def prepare(self, dt: float, t0: float, t1: float) -> tuple[Bunch, Bunch]:
         """Prepare all couplings for simulation.
@@ -313,7 +337,7 @@ class Network:
         coupling_data_dict = Bunch()
         coupling_state_dict = Bunch()
 
-        for name, coupling in self.couplings.items():
+        for name, coupling in self.coupling.items():
             data, state = coupling.prepare(self, dt, t0, t1)
             coupling_data_dict[name] = data
             coupling_state_dict[name] = state
@@ -367,12 +391,12 @@ class Network:
         coupling_inputs = Bunch()
 
         for name, n_dims in self.dynamics.COUPLING_INPUTS.items():
-            if name not in self.couplings:
+            if name not in self.coupling:
                 # Missing coupling - use zeros
                 coupling_inputs[name] = jnp.zeros((n_dims, self.graph.n_nodes))
             else:
                 # Compute coupling
-                coupling = self.couplings[name]
+                coupling = self.coupling[name]
                 data = coupling_data_dict[name]
                 state_data = coupling_state_dict[name]
                 coupling_inputs[name] = coupling.compute(
@@ -436,7 +460,7 @@ class Network:
         """
         new_states = Bunch()
 
-        for name, coupling in self.couplings.items():
+        for name, coupling in self.coupling.items():
             new_states[name] = coupling.update_state(
                 coupling_data_dict[name],
                 coupling_state_dict[name],
@@ -487,7 +511,7 @@ class Network:
 
         # Couplings as nested dict
         p.coupling = Bunch()
-        for name, coupling in self.couplings.items():
+        for name, coupling in self.coupling.items():
             p.coupling[name] = coupling.params
 
         # External inputs as nested dict
@@ -587,7 +611,7 @@ class Network:
             "Network(",
             f"  dynamics={self.dynamics.__class__.__name__}",
             f"  nodes={self.graph.n_nodes}",
-            f"  couplings={list(self.couplings.keys())}",
+            f"  coupling={list(self.coupling.keys())}",
         ]
 
         if self.externals:

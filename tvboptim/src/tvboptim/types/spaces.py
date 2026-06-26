@@ -40,8 +40,35 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pandas as pd
 
 from tvboptim.utils import safe_reshape
+
+
+def _keypath_to_name(keypath):
+    """Convert a JAX KeyPath to a readable dot-separated column name.
+
+    Examples
+    --------
+    >>> # DictKey / GetAttrKey use dot notation
+    >>> # (DictKey('model'), DictKey('G'))  → 'model.G'
+    >>> # SequenceKey uses bracket notation
+    >>> # (DictKey('results'), SequenceKey(0))  → 'results[0]'
+    >>> # (SequenceKey(0), DictKey('amplitude'))  → '[0].amplitude'
+    """
+    parts = []
+    for key in keypath:
+        if hasattr(key, "key"):  # DictKey
+            parts.append(f".{key.key}")
+        elif hasattr(key, "idx"):  # SequenceKey
+            parts.append(f"[{key.idx}]")
+        elif hasattr(key, "name"):  # GetAttrKey (namedtuple)
+            parts.append(f".{key.name}")
+        else:
+            parts.append(f".{key}")
+    name = "".join(parts).lstrip(".")
+    return name if name else "value"
+
 
 try:
     import numpyro.distributions  # noqa: F401
@@ -94,9 +121,17 @@ class AbstractAxis(ABC):
     >>> print(f"Normal samples: {values}")
     """
 
-    def __init__(self):
-        """Initialize axis."""
-        pass
+    def __init__(self, group=None):
+        """Initialize axis.
+
+        Parameters
+        ----------
+        group : hashable, optional
+            Group label. Axes sharing the same group are zipped together
+            into a single composite axis before the Space's combination
+            mode is applied. Default is None (ungrouped).
+        """
+        self.group = group
 
     @abstractmethod
     def generate_values(self, key: Optional[jax.random.PRNGKey] = None) -> jnp.ndarray:
@@ -160,7 +195,12 @@ class GridAxis(AbstractAxis):
     """
 
     def __init__(
-        self, low: float, high: float, n: int, shape: Optional[Tuple[int, ...]] = None
+        self,
+        low: float,
+        high: float,
+        n: int,
+        shape: Optional[Tuple[int, ...]] = None,
+        group=None,
     ):
         """Initialize grid axis.
 
@@ -175,8 +215,10 @@ class GridAxis(AbstractAxis):
         shape : Tuple[int, ...], optional
             Shape of generated values. If specified, values are broadcast to this shape.
             Default is None.
+        group : hashable, optional
+            Group label for axis grouping. See AbstractAxis. Default is None.
         """
-        super().__init__()
+        super().__init__(group=group)
         self.low = low
         self.high = high
         self.n = n
@@ -253,7 +295,12 @@ class LogGridAxis(AbstractAxis):
     """
 
     def __init__(
-        self, low: float, high: float, n: int, shape: Optional[Tuple[int, ...]] = None
+        self,
+        low: float,
+        high: float,
+        n: int,
+        shape: Optional[Tuple[int, ...]] = None,
+        group=None,
     ):
         """Initialize log grid axis.
 
@@ -268,8 +315,10 @@ class LogGridAxis(AbstractAxis):
         shape : Tuple[int, ...], optional
             Shape of generated values. If specified, values are broadcast to this shape.
             Default is None.
+        group : hashable, optional
+            Group label for axis grouping. See AbstractAxis. Default is None.
         """
-        super().__init__()
+        super().__init__(group=group)
         self.low = low
         self.high = high
         self.n = n
@@ -350,7 +399,12 @@ class UniformAxis(AbstractAxis):
     """
 
     def __init__(
-        self, low: float, high: float, n: int, shape: Optional[Tuple[int, ...]] = None
+        self,
+        low: float,
+        high: float,
+        n: int,
+        shape: Optional[Tuple[int, ...]] = None,
+        group=None,
     ):
         """Initialize uniform axis.
 
@@ -365,8 +419,10 @@ class UniformAxis(AbstractAxis):
         shape : Tuple[int, ...], optional
             Shape of generated values. If specified, values are broadcast to this shape.
             Default is None.
+        group : hashable, optional
+            Group label for axis grouping. See AbstractAxis. Default is None.
         """
-        super().__init__()
+        super().__init__(group=group)
         self.low = low
         self.high = high
         self.n = n
@@ -445,15 +501,17 @@ class DataAxis(AbstractAxis):
     >>> print(data_jax.size)  # 5
     """
 
-    def __init__(self, values: Union[List, jnp.ndarray]):
+    def __init__(self, values: Union[List, jnp.ndarray], group=None):
         """Initialize data axis.
 
         Parameters
         ----------
         values : array-like
             Predefined values to sample from.
+        group : hashable, optional
+            Group label for axis grouping. See AbstractAxis. Default is None.
         """
-        super().__init__()
+        super().__init__(group=group)
         self.values = jnp.asarray(values)
 
         if self.values.size == 0:
@@ -546,6 +604,7 @@ class NumPyroAxis(AbstractAxis):
         n: int,
         sample_shape: Optional[Tuple[int, ...]] = None,
         broadcast_mode: bool = False,
+        group=None,
     ):
         """Initialize NumPyro distribution axis.
 
@@ -560,8 +619,10 @@ class NumPyroAxis(AbstractAxis):
         broadcast_mode : bool, optional
             If True, sample once per axis point then broadcast to sample_shape.
             If False, sample independently for each element. Default is False.
+        group : hashable, optional
+            Group label for axis grouping. See AbstractAxis. Default is None.
         """
-        super().__init__()
+        super().__init__(group=group)
 
         if not NUMPYRO_AVAILABLE:
             raise ImportError(
@@ -735,6 +796,38 @@ class Space:
         # Calculate total combinations
         self._N = self._calculate_total_size()
 
+    def _get_effective_sizes(self, axes):
+        """Compute effective axis sizes accounting for groups.
+
+        Axes sharing a group label are zipped together into a single
+        composite axis. Returns one effective size per group plus one
+        per ungrouped axis.
+        """
+        from collections import OrderedDict
+
+        groups = OrderedDict()  # group_label -> list of sizes
+        ungrouped_sizes = []
+
+        for axis in axes:
+            if axis.group is not None:
+                groups.setdefault(axis.group, []).append(axis.size)
+            else:
+                ungrouped_sizes.append(axis.size)
+
+        effective_sizes = []
+        for group_label, sizes in groups.items():
+            min_s = min(sizes)
+            max_s = max(sizes)
+            if min_s != max_s:
+                print(
+                    f"WARNING: Axes in group '{group_label}' have different sizes "
+                    f"{sizes}. Using minimum size {min_s}."
+                )
+            effective_sizes.append(min_s)
+
+        effective_sizes.extend(ungrouped_sizes)
+        return effective_sizes
+
     def _calculate_total_size(self) -> int:
         """Calculate total number of parameter combinations."""
         axes = jax.tree.leaves(
@@ -744,20 +837,20 @@ class Space:
         if not axes:
             return 1
 
-        axis_sizes = [axis.size for axis in axes]
+        effective_sizes = self._get_effective_sizes(axes)
 
         if self.mode == "product":
-            return int(np.prod(axis_sizes))
+            return int(np.prod(effective_sizes))
         elif self.mode == "zip":
-            min_size = min(axis_sizes)
-            max_size = max(axis_sizes)
+            min_size = min(effective_sizes)
+            max_size = max(effective_sizes)
 
-            # Warn if axes have different sizes in zip mode
             if min_size != max_size:
-                lost_combinations = sum(size - min_size for size in axis_sizes)
+                lost_combinations = sum(size - min_size for size in effective_sizes)
                 print(
-                    f"WARNING: In zip mode, axes have different sizes {axis_sizes}. "
-                    f"Using minimum size {min_size}, losing {lost_combinations} combinations."
+                    f"WARNING: In zip mode, effective axes have different sizes "
+                    f"{effective_sizes}. Using minimum size {min_size}, "
+                    f"losing {lost_combinations} combinations."
                 )
 
             return min_size
@@ -812,15 +905,74 @@ class Space:
         if not axis_values_list:
             return [], axis_tree_def
 
-        if self.mode == "product":
-            # Create meshgrid for Cartesian product and flatten each
-            meshgrid_arrays = jnp.meshgrid(*axis_values_list, indexing="ij")
-            flattened_arrays = [arr.flatten() for arr in meshgrid_arrays]
-        elif self.mode == "zip":
-            # In zip mode, arrays are already aligned
-            flattened_arrays = axis_values_list
+        # Get axes in same flat order to read group labels
+        axes_flat = jax.tree.leaves(
+            self.axis_state, is_leaf=lambda x: isinstance(x, AbstractAxis)
+        )
 
-        return flattened_arrays, axis_tree_def
+        # Check if any groups exist — fast path if not
+        has_groups = any(a.group is not None for a in axes_flat)
+
+        if not has_groups:
+            # Original ungrouped logic
+            if self.mode == "product":
+                meshgrid_arrays = jnp.meshgrid(*axis_values_list, indexing="ij")
+                flattened_arrays = [arr.flatten() for arr in meshgrid_arrays]
+            elif self.mode == "zip":
+                flattened_arrays = axis_values_list
+            return flattened_arrays, axis_tree_def
+
+        # --- Grouped logic ---
+        from collections import OrderedDict
+
+        # Partition axes into groups and ungrouped
+        group_map = OrderedDict()  # group_label -> [(flat_idx, values), ...]
+        ungrouped = []  # [(flat_idx, values), ...]
+
+        for i, (axis, values) in enumerate(zip(axes_flat, axis_values_list)):
+            if axis.group is not None:
+                group_map.setdefault(axis.group, []).append((i, values))
+            else:
+                ungrouped.append((i, values))
+
+        # Build effective axes: one representative per group + one per ungrouped
+        effective_values = []
+        # Each entry: ('group', [(orig_idx, truncated_values), ...])
+        #          or ('single', orig_idx)
+        effective_meta = []
+
+        for group_label, members in group_map.items():
+            sizes = [v.shape[0] for _, v in members]
+            eff_size = min(sizes)
+            truncated = [(idx, v[:eff_size]) for idx, v in members]
+            # Use index array as representative for meshgrid
+            effective_values.append(jnp.arange(eff_size))
+            effective_meta.append(("group", truncated))
+
+        for idx, values in ungrouped:
+            effective_values.append(values)
+            effective_meta.append(("single", idx))
+
+        # Apply combination mode on effective axes
+        if self.mode == "product":
+            meshgrid_arrays = jnp.meshgrid(*effective_values, indexing="ij")
+            flat_effective = [arr.flatten() for arr in meshgrid_arrays]
+        elif self.mode == "zip":
+            flat_effective = effective_values
+
+        # Expand back to original flat ordering
+        result = [None] * len(axis_values_list)
+
+        for eff_idx, (meta, combined) in enumerate(zip(effective_meta, flat_effective)):
+            kind, payload = meta
+            if kind == "group":
+                index_array = combined.astype(jnp.int32)
+                for orig_idx, truncated_values in payload:
+                    result[orig_idx] = truncated_values[index_array]
+            else:  # 'single'
+                result[payload] = combined
+
+        return result, axis_tree_def
 
     def _get_combination_at_index(self, index: int) -> Dict[str, Any]:
         """Get a single combination by indexing into flattened arrays."""
@@ -931,8 +1083,14 @@ class Space:
                     f"Slice {index} results in empty parameter space with no combinations"
                 )
 
-            # Create new axis state with DataAxis instances
-            data_axes = [DataAxis(values) for values in sliced_arrays]
+            # Create new axis state with DataAxis instances, preserving groups
+            axes_flat = jax.tree.leaves(
+                self.axis_state, is_leaf=lambda x: isinstance(x, AbstractAxis)
+            )
+            data_axes = [
+                DataAxis(values, group=axis.group)
+                for values, axis in zip(sliced_arrays, axes_flat)
+            ]
             new_axis_state = jax.tree.unflatten(axis_tree_def, data_axes)
 
             # Create new Space in zip mode
@@ -1038,8 +1196,45 @@ class Space:
         else:
             return batched_axis_tree, self.static_state
 
+    def to_dataframe(self) -> pd.DataFrame:
+        """Convert parameter space to a pandas DataFrame.
+
+        Each row is one parameter combination. Column names are derived
+        from the pytree key paths (e.g. ``'coupling.G'``, ``'noise.sigma'``).
+        Scalar leaves become scalar cells; array leaves become object cells
+        containing numpy arrays.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with one row per combination and one column per leaf.
+        """
+        # Derive column names from axis positions in axis_state only,
+        # not from the full combined state (which includes all equinox module
+        # leaves and would produce numeric/garbage column names).
+        paths_and_leaves, _ = jax.tree_util.tree_flatten_with_path(
+            self.axis_state, is_leaf=lambda x: isinstance(x, AbstractAxis)
+        )
+        axis_paths = [
+            p for p, leaf in paths_and_leaves if isinstance(leaf, AbstractAxis)
+        ]
+        col_names = [_keypath_to_name(p) for p in axis_paths]
+
+        flattened_arrays, _ = self._generate_all_combinations()
+
+        columns = {}
+        for name, arr in zip(col_names, flattened_arrays):
+            arr_np = np.asarray(arr)
+            # tolist() converts 0-dim slices to plain Python scalars (hashable),
+            # needed for pandas pivot/groupby. Multi-dim axes stay as arrays.
+            columns[name] = arr_np.tolist() if arr_np.ndim == 1 else list(arr_np)
+
+        return pd.DataFrame(columns)
+
     def __repr__(self):
         axes = jax.tree.leaves(
             self.axis_state, is_leaf=lambda x: isinstance(x, AbstractAxis)
         )
-        return f"Space(N={self.N}, mode='{self.mode}', axes={len(axes)})"
+        groups = {a.group for a in axes if a.group is not None}
+        group_info = f", groups={len(groups)}" if groups else ""
+        return f"Space(N={self.N}, mode='{self.mode}', axes={len(axes)}{group_info})"

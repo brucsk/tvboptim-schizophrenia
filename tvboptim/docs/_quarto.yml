@@ -4,6 +4,8 @@ project:
   render:
     - "*.qmd"
     - "!*.ipynb"  # Don't render notebooks (they're for Colab)
+    - "!workflows/Hopf.qmd"  # Work in progress, excluded from builds
+    - "!workflows/Hopf_w_GenOpt.qmd"  # Work in progress, excluded from builds
   
 website:
   title: ""
@@ -25,6 +27,8 @@ website:
           - file: workflows/RWW.qmd
           - file: workflows/JR.qmd
           - file: workflows/EI_Tuning.qmd
+          - file: workflows/Hopf_Pareto_ParallelOpt.qmd
+          - file: workflows/Stimulation_with_Bayesian_Inference.qmd
       - text: "Network Dynamics"
         menu:
           - file: network_dynamics/network_dynamics.qmd
@@ -36,10 +40,9 @@ website:
           - file: network_dynamics/solvers.qmd
       - text: "Advanced Topics"
         menu:
-          - text: "Performance Tips"
           - file: advanced/buffer_strategies.qmd
+          - file: advanced/gradient_checkpointing.qmd
           - file: advanced/subspace_coupling.qmd
-          - text: "Constraining Parameters"
       - text: "Reference"
         file: reference/index.qmd
   # sidebar:
@@ -73,6 +76,11 @@ format:
       toggle: true
     code-download: true
     highlight-style: github
+    lightbox: auto
+    grid:
+      body-width: 1000px
+      sidebar-width: 250px
+      margin-width: 250px
 
 quartodoc:
   render_interlinks: true

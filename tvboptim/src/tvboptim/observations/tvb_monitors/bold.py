@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import equinox as eqx
 import jax
@@ -8,7 +9,22 @@ import matplotlib.pyplot as plt
 
 from tvboptim.experimental.network_dynamics.result import NativeSolution
 
-from .downsampling import AbstractMonitor, TemporalAverage
+from .downsampling import AbstractMonitor, TemporalAverage, _slice_variable_names
+
+
+def _bold_variable_names(sol, voi=None):
+    """Build BOLD output variable names by wrapping source names as 'BOLD(<name>)'.
+
+    If `voi` is provided, source names are sliced by it first (used when the
+    monitor does its own voi selection instead of delegating to a downsampler).
+    Returns None if the source has no variable_names.
+    """
+    names = _slice_variable_names(sol, voi) if voi is not None else getattr(
+        sol, "variable_names", None
+    )
+    if names is None:
+        return None
+    return tuple(f"BOLD({n})" for n in names)
 
 
 class HRFKernel(eqx.Module):
@@ -21,14 +37,20 @@ class HRFKernel(eqx.Module):
         duration: Duration of kernel support in milliseconds
     """
 
-    duration: float
+    duration: eqx.AbstractVar[float]
 
     def __call__(self, t: jax.Array, downsample_dt: float) -> jax.Array:
         """Compute kernel values at time points.
 
         Args:
             t: Time points at which to evaluate the kernel
-            downsample_dt: Time step of downsampled signal (for internal use)
+            downsample_dt: Step size of the convolution grid `t` is sampled on.
+                Closed-form kernels (e.g. FirstOrderVolterraHRFKernel) are exact
+                functions of `t` and ignore this. It is part of the interface
+                for grid-dependent kernels not yet implemented — e.g. an
+                empirical/tabulated HRF that must resample itself onto the
+                convolution grid, or a kernel that scales by the sample spacing
+                to approximate the convolution integral.
 
         Returns:
             Kernel values at the specified time points
@@ -65,10 +87,16 @@ class HRFKernel(eqx.Module):
         return ax
 
 
-class LotkaVolterraHRFKernel(HRFKernel):
-    """Canonical hemodynamic response function based on Lotka-Volterra dynamics.
+class FirstOrderVolterraHRFKernel(HRFKernel):
+    """First-order Volterra kernel of the hemodynamic system.
 
-    This implements the oscillatory HRF kernel used in standard BOLD signal modeling.
+    This is the canonical damped-oscillator HRF used in standard BOLD signal
+    modeling — the first-order Volterra kernel of the Balloon/Windkessel
+    hemodynamics (Friston et al. 2000). Ported from TVB's ``FirstOrderVolterra``
+    equation.
+
+    Despite the shared name of the mathematician Vito Volterra, this is
+    unrelated to Lotka-Volterra (predator-prey) dynamics.
 
     Attributes:
         tau_s: Signal decay time constant in seconds (default: 0.8 s)
@@ -77,8 +105,15 @@ class LotkaVolterraHRFKernel(HRFKernel):
         duration: Kernel support duration in ms (default: 20,000 ms = 20 s)
 
     Note:
-        The tau parameters are in seconds (not ms) to match the standard HRF formulation.
-        Time input to __call__ is expected in milliseconds and converted internally.
+        The tau parameters are in seconds (not ms) to match the standard HRF
+        formulation. Time input to __call__ is expected in milliseconds and
+        converted internally.
+
+        This is the *underdamped* solution: the oscillation frequency
+        ``omega = sqrt(1/tau_f - 1/(4*tau_s**2))`` is real only when
+        ``4*tau_s**2 > tau_f``. The defaults satisfy this. Parameter values that
+        violate it make ``omega`` NaN and the whole kernel NaN — the overdamped
+        regime (which would need ``sinh`` instead of ``sin``) is not supported.
     """
 
     tau_s: float = 0.8  # seconds
@@ -86,22 +121,8 @@ class LotkaVolterraHRFKernel(HRFKernel):
     scaling: float = 1.0 / 3.0
     duration: float = 20_000.0  # ms (20 seconds)
 
-    def __init__(self, tau_s=0.8, tau_f=0.4, scaling=1.0 / 3.0, duration=20_000.0):
-        """Initialize Lotka-Volterra HRF kernel.
-
-        Args:
-            tau_s: Signal decay time constant in seconds (default: 0.8 s)
-            tau_f: Feedback time constant in seconds (default: 0.4 s)
-            scaling: Kernel amplitude scaling factor (default: 1/3)
-            duration: Kernel support duration in ms (default: 20,000 ms)
-        """
-        self.tau_s = tau_s
-        self.tau_f = tau_f
-        self.scaling = scaling
-        self.duration = duration
-
     def __call__(self, t: jax.Array, downsample_dt: float) -> jax.Array:
-        """Compute Lotka-Volterra HRF kernel.
+        """Compute the first-order Volterra HRF kernel.
 
         Args:
             t: Time points in milliseconds at which to evaluate the kernel
@@ -150,12 +171,6 @@ class GammaHRFKernel(HRFKernel):
     a: float = 0.1
     duration: float = 20_000.0  # ms
 
-    def __init__(self, tau=1.08, n=3.0, a=0.1, duration=20_000.0):
-        self.tau = tau
-        self.n = n
-        self.a = a
-        self.duration = duration
-
     def __call__(self, t: jax.Array, downsample_dt: float) -> jax.Array:
         # Convert time from ms to seconds for the HRF formula
         t_s = t / 1000.0
@@ -168,14 +183,16 @@ class GammaHRFKernel(HRFKernel):
         ) / (self.tau * factorial)
 
         # Replicate TVBSim's normalization and amplitude scaling from evaluate()
-        kernel = kernel / jnp.max(kernel)
+        peak = jnp.max(kernel)
+        peak = jnp.where(peak > 0, peak, 1.0) # Avoid division by zero
+        kernel = kernel / peak
         kernel = kernel * self.a
 
         return kernel
 
 class DoubleExponentialHRFKernel(HRFKernel):
     """
-    A difference of two exponential functions to define a kernel for the bold monitor, ported from TVBSim's 	DoubleExponential class.
+    A difference of two exponential functions to define a kernel for the bold monitor, ported from TVBSim's DoubleExponential class.
 
     h(t) = amp_1*exp(-t/tau_1)*sin(2*pi*f_1*t) - amp_2*exp(-t/tau_2)*sin(2*pi*f_2*t)
     normalized and scaled by amplitude factor `a`.
@@ -212,18 +229,7 @@ class DoubleExponentialHRFKernel(HRFKernel):
     amp_1: float = 0.1
     amp_2: float = 0.1
     a: float = 0.1 
-    duration: float = 20_000.0  # ms
-
-    def __init__(self, tau_1=7.22, tau_2=7.4, f_1=0.03, f_2=0.12, amp_1=0.1,
-                                 amp_2=0.1, a=0.1, duration=20_000.0):
-        self.tau_1 = tau_1
-        self.tau_2 = tau_2
-        self.f_1 = f_1
-        self.f_2 = f_2
-        self.amp_1 = amp_1
-        self.amp_2 = amp_2
-        self.a = a
-        self.duration = duration
+    duration: float = 40_000.0  # ms
 
     def __call__(self, t: jax.Array, downsample_dt: float) -> jax.Array:
         # Convert ms to seconds
@@ -234,12 +240,77 @@ class DoubleExponentialHRFKernel(HRFKernel):
                   )
 
         # Replicate TVBSim's normalization + amplitude scaling from evaluate()
-        kernel = kernel / jnp.max(kernel)
+        peak = jnp.max(kernel)
+        peak = jnp.where(peak > 0, peak, 1.0) # Avoid division by zero
+        kernel = kernel / peak
         kernel = kernel * self.a
 
         return kernel
-    
-class Bold(AbstractMonitor):
+
+class MixtureOfGammasHRFKernel(HRFKernel):
+    """
+    Mixture of two gamma distributions HRF kernel, ported from TVBSim's MixtureOfGammas.
+
+    hrf(t) = (l*t)^(a_1-1) * exp(-l*t) / Γ(a_1)
+           - c * (l*t)^(a_2-1) * exp(-l*t) / Γ(a_2)
+
+    Parameters
+    ----------
+    a_1 : float
+        Shape parameter of the first gamma pdf (default: 6.0)
+    a_2 : float
+        Shape parameter of the second gamma pdf (default: 13.0)
+    l : float
+        Scale parameter / lambda (default: 1.0)
+    c : float
+        Scaling factor of the second gamma pdf (default: 0.4)
+    duration : float
+        Kernel support duration [ms] (default: 20_000)
+
+    Reference
+    ---------
+    Glover (1999). Deconvolution of Impulse Response in Event-Related BOLD fMRI.
+    NeuroImage 9, 416-429.
+    """
+
+    a_1: float = 6.0
+    a_2: float = 13.0
+    l: float = 1.0
+    c: float = 0.4
+    duration: float = 20_000.0
+
+    def __call__(self, t: jax.Array, downsample_dt: float) -> jax.Array:
+        t_s = t / 1000.0
+
+        gamma_a_1 = jsp.special.gamma(self.a_1)
+        gamma_a_2 = jsp.special.gamma(self.a_2)
+
+        return (
+            (self.l * t_s) ** (self.a_1 - 1) * jnp.exp(-self.l * t_s) / gamma_a_1
+            - self.c
+            * (self.l * t_s) ** (self.a_2 - 1)
+            * jnp.exp(-self.l * t_s)
+            / gamma_a_2
+        )
+
+def LotkaVolterraHRFKernel(*args, **kwargs):
+    """Deprecated: use FirstOrderVolterraHRFKernel.
+
+    The kernel was misnamed — it is the first-order Volterra kernel of the
+    hemodynamic system (Friston 2000), unrelated to Lotka-Volterra dynamics.
+    """
+    warnings.warn(
+        "LotkaVolterraHRFKernel is deprecated and will be removed in a future "
+        "version. Use FirstOrderVolterraHRFKernel instead — the kernel is the "
+        "first-order Volterra kernel of the hemodynamic system (Friston 2000), "
+        "unrelated to Lotka-Volterra dynamics.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return FirstOrderVolterraHRFKernel(*args, **kwargs)
+
+
+class HRFBold(AbstractMonitor):
     """BOLD signal monitor using hemodynamic response function convolution.
 
     This monitor simulates the Blood Oxygen Level Dependent (BOLD) signal by:
@@ -300,7 +371,7 @@ class Bold(AbstractMonitor):
 
         # Set up kernel
         if kernel is None:
-            self.kernel = LotkaVolterraHRFKernel()
+            self.kernel = FirstOrderVolterraHRFKernel()
         else:
             self.kernel = kernel
 
@@ -310,6 +381,10 @@ class Bold(AbstractMonitor):
             self.downsample = TemporalAverage(voi=self.voi, period=downsample_period)
         else:
             self.downsample = downsample
+            # Sync downsample_period with the actual monitor's period
+            # so kernel sampling and final BOLD subsampling use the correct grid
+            if hasattr(downsample, "period"):
+                self.downsample_period = downsample.period
 
         # Process history buffer
         self.history = self._process_history(history)
@@ -333,8 +408,17 @@ class Bold(AbstractMonitor):
             n_samples = int(math.ceil(self.kernel.duration / self.downsample_period))
             # Downsample the history first
             downsampled_history = self.downsample(history)
-            # Take the last n_samples
-            return downsampled_history.ys[-n_samples:]
+            hist = downsampled_history.ys
+            # Pad with zeros at the front when history is shorter than the
+            # kernel support — otherwise 'valid' convolution loses output samples.
+            if hist.shape[0] < n_samples:
+                pad = jnp.zeros(
+                    (n_samples - hist.shape[0], *hist.shape[1:]), dtype=hist.dtype
+                )
+                hist = jnp.vstack([pad, hist])
+            else:
+                hist = hist[-n_samples:]
+            return hist
         else:
             # Assume it's already a jax.Array
             return history
@@ -351,7 +435,11 @@ class Bold(AbstractMonitor):
             NativeSolution with BOLD signal timeseries
         """
         ts = sol.ts
-        dt = sol.dt  # Use dt from auxiliary data
+        dt = self._resolve_dt(sol)
+        # sol.ts follows the native-solver convention where ts[0] = t0 + dt
+        # (post-step state); recover the simulation start t0 to anchor BOLD
+        # samples at clean period-multiples.
+        t0 = ts[0] - dt
 
         # --- Downsample neural activity ---
         downsampled = self.downsample(sol)
@@ -392,16 +480,207 @@ class Bold(AbstractMonitor):
         final_samples_per_period = self.period / self.downsample_period
         final_idx_step = int(round(final_samples_per_period))
 
-        # Sample at the specified period
-        bold_indices = jnp.arange(0, bold.shape[0], final_idx_step)
+        # Sample at the end of each TR, matching BalloonWindkesselBold's
+        # "at end of each period" convention. Index 0 of the valid-conv output
+        # corresponds to simulation time t=ts[0] (only the zero-padded warmup
+        # has been integrated), so we skip it and take [period, 2*period, ...].
+        bold_indices = jnp.arange(final_idx_step, bold.shape[0], final_idx_step)
         bold_signal = bold[bold_indices, ...]
 
-        # Create time points for BOLD signal using Python int() and round()
-        bold_time = ts[:: int(round(self.period / dt))] + t_offset
+        n_bold = bold_signal.shape[0]
+        bold_time = t0 + (jnp.arange(n_bold) + 1) * self.period + t_offset
 
-        # Ensure time and signal arrays match in length
-        min_len = min(len(bold_time), len(bold_signal))
-        bold_time = bold_time[:min_len]
-        bold_signal = bold_signal[:min_len]
+        return NativeSolution(
+            ts=bold_time,
+            ys=bold_signal,
+            dt=self.period,
+            variable_names=_bold_variable_names(downsampled),
+        )
 
-        return NativeSolution(ts=bold_time, ys=bold_signal, dt=self.period)
+
+class BalloonWindkesselBold(AbstractMonitor):
+    """BOLD signal monitor using Balloon-Windkessel hemodynamic ODE.
+
+    Integrates a four-variable ODE system (vasodilatory signal, blood flow,
+    blood volume, deoxyhemoglobin) driven by neural firing rates, then
+    computes BOLD signal from the hemodynamic state.
+
+    The user-facing interface uses milliseconds for time parameters (period,
+    dt_bw). Internally the BW ODE is integrated in seconds, matching the
+    standard reference implementation (Friston 2000, Deco 2014).
+
+    Parameters (user-facing, in ms)
+    --------------------------------
+    period : float
+        BOLD sampling period (TR) in ms (default: 2000.0)
+    dt_bw : float
+        Integration time step for BW equations in ms (default: 1.0)
+
+    Parameters (hemodynamic, in seconds)
+    -------------------------------------
+    taus : float
+        Vasodilatory signal decay time constant in s (default: 0.65)
+    tauf : float
+        Autoregulatory feedback time constant in s (default: 0.41)
+    tauo : float
+        Transit time in s (default: 0.98)
+    alpha : float
+        Grubb's vessel stiffness exponent (default: 0.32)
+    Eo : float
+        Resting oxygen extraction fraction (default: 0.4)
+    vo : float
+        Resting blood volume fraction (default: 0.04)
+    TE : float
+        Echo time in s (default: 0.04)
+
+    References
+    ----------
+    - Friston et al. (2000). Nonlinear Responses in fMRI: The Balloon Model,
+      Volterra Kernels, and Other Hemodynamics. NeuroImage, 12(4), 466-477.
+    - Deco et al. (2014). How Local Excitation-Inhibition Ratio Impacts the
+      Whole Brain Dynamics. Journal of Neuroscience, 34(23), 7886-7898.
+    """
+
+    period: float = eqx.field(static=True)
+    dt_bw: float = eqx.field(static=True)
+
+    # Hemodynamic parameters (in seconds)
+    taus: float
+    tauf: float
+    tauo: float
+    alpha: float
+    Eo: float
+    vo: float
+
+    # BOLD signal parameters
+    k1: float
+    k2: float
+    k3: float
+
+    # Optional downsampling before BW integration
+    downsample: eqx.Module = eqx.field(static=True)
+
+    def __init__(
+        self,
+        period=2000.0,
+        dt_bw=1.0,
+        taus=0.65,
+        tauf=0.41,
+        tauo=0.98,
+        alpha=0.32,
+        Eo=0.4,
+        vo=0.04,
+        TE=0.04,
+        voi=None,
+        downsample=None,
+    ):
+        self.voi = self._normalize_voi(voi)
+        self.period = period
+        self.dt_bw = dt_bw
+
+        self.taus = taus
+        self.tauf = tauf
+        self.tauo = tauo
+        self.alpha = alpha
+        self.Eo = Eo
+        self.vo = vo
+
+        self.k1 = 4.3 * 40.3 * Eo * TE
+        self.k2 = 25.0 * Eo * TE
+        self.k3 = 1.0
+
+        self.downsample = downsample
+
+    def __call__(self, sol, t_offset=0.0):
+        """Apply Balloon-Windkessel BOLD model to simulation results.
+
+        Parameters
+        ----------
+        sol : NativeSolution
+            Simulation result with .ys [T, n_voi, N], .ts (ms), .dt (ms).
+            The selected variable of interest should contain firing rates
+            in Hz.
+        t_offset : float
+            Time offset added to output timestamps in ms (default: 0.0)
+
+        Returns
+        -------
+        NativeSolution
+            BOLD signal with shape [T_bold, 1, N], timestamps in ms.
+        """
+        if self.downsample is not None:
+            sol = self.downsample(sol)
+
+        ys = sol.ys[:, self.voi, :]
+        ys = ys.squeeze(axis=1)  # [T, N]
+        input_dt = sol.dt
+
+        steps_per_input = int(round(input_dt / self.dt_bw))
+        if steps_per_input > 1:
+            ys = jnp.repeat(ys, steps_per_input, axis=0)
+        elif steps_per_input < 1:
+            step = int(round(self.dt_bw / input_dt))
+            ys = ys[::step]
+
+        T, N = ys.shape
+        save_every = int(round(self.period / self.dt_bw))
+
+        dt_s = self.dt_bw / 1000.0
+
+        itaus = 1.0 / self.taus
+        itauf = 1.0 / self.tauf
+        itauo = 1.0 / self.tauo
+        ialpha = 1.0 / self.alpha
+        Eo = self.Eo
+        k1, k2, k3, vo = self.k1, self.k2, self.k3, self.vo
+
+        def bw_step(state, r):
+            s, f, v, q = state
+
+            ds = r - itaus * s - itauf * (f - 1.0)
+            df = s
+            dv = itauo * (f - v**ialpha)
+            dq = itauo * (
+                f * (1.0 - (1.0 - Eo) ** (1.0 / f)) / Eo - v ** (ialpha - 1.0) * q
+            )
+
+            s = s + dt_s * ds
+            f = f + dt_s * df
+            v = v + dt_s * dv
+            q = q + dt_s * dq
+
+            bold = vo * (k1 * (1.0 - q) + k2 * (1.0 - q / v) + k3 * (1.0 - v))
+            return (s, f, v, q), bold
+
+        init = (
+            jnp.zeros(N),  # s: vasodilatory signal
+            jnp.ones(N),  # f: blood flow
+            jnp.ones(N),  # v: blood volume
+            jnp.ones(N),  # q: deoxyhemoglobin
+        )
+
+        _, bold_all = jax.lax.scan(bw_step, init, ys)  # [T, N]
+
+        bold_signal = bold_all[save_every - 1 :: save_every]  # [T_bold, N]
+        bold_signal = bold_signal[:, jnp.newaxis, :]  # [T_bold, 1, N]
+
+        n_bold = bold_signal.shape[0]
+        bold_ts = jnp.arange(n_bold) * self.period + self.period + t_offset
+
+        return NativeSolution(
+            ts=bold_ts,
+            ys=bold_signal,
+            dt=self.period,
+            variable_names=_bold_variable_names(sol, voi=self.voi),
+        )
+
+
+def Bold(*args, **kwargs):
+    """Deprecated: use HRFBold or BalloonWindkesselBold explicitly."""
+    warnings.warn(
+        "Bold is deprecated and will be removed in a future version. "
+        "Use HRFBold (HRF convolution) or BalloonWindkesselBold (ODE integration) explicitly.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return HRFBold(*args, **kwargs)

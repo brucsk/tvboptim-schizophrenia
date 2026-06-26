@@ -2,8 +2,11 @@ from abc import ABC
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pandas as pd
 from tqdm import tqdm
 
+from tvboptim.types.spaces import _keypath_to_name
 from tvboptim.types.stateutils import combine_state
 
 
@@ -16,7 +19,24 @@ class Result(ABC):
     Result type to provide unified indexing
     """
 
-    pass
+    space = None
+
+    def _result_col_names(self, param_cols) -> list:
+        """Derive result column names from the first result, handling collisions."""
+        sample = self[0]
+        paths_and_leaves, _ = jax.tree_util.tree_flatten_with_path(sample)
+        col_names = [_keypath_to_name(p) for p, _ in paths_and_leaves]
+        for i, name in enumerate(col_names):
+            if name in param_cols:
+                col_names[i] = f"result.{name}"
+        return col_names
+
+    @staticmethod
+    def _assign_leaves(df, col_names, leaves):
+        """Assign (N, ...) numpy leaves to DataFrame columns."""
+        for name, leaf in zip(col_names, leaves):
+            df[name] = leaf if leaf.ndim == 1 else list(leaf)
+        return df
 
 
 class SequentialExecution(Execution):
@@ -95,12 +115,13 @@ class SequentialExecution(Execution):
                 jax.block_until_ready(self.model(state, *self.args, **self.kwargs))
             )
             # results.append(jax.block_until_ready(self.model(state, *self.args, **self.kwargs)))
-        return SequentialResult(results)
+        return SequentialResult(results, space=self.statespace)
 
 
 class SequentialResult(Result):
-    def __init__(self, results):
+    def __init__(self, results, space=None):
         self.results = results
+        self.space = space
 
     def __iter__(self):
         return iter(self.results)
@@ -110,6 +131,15 @@ class SequentialResult(Result):
 
     def __len__(self):
         return len(self.results)
+
+    def to_dataframe(self) -> pd.DataFrame:
+        df = self.space.to_dataframe() if self.space is not None else pd.DataFrame()
+        col_names = self._result_col_names(df.columns)
+
+        # Stack N individual results into a single pytree of (N, ...) arrays
+        stacked = jax.tree.map(lambda *xs: np.stack(xs), *self.results)
+        leaves = jax.tree.leaves(stacked)
+        return self._assign_leaves(df, col_names, leaves)
 
 
 class ParallelExecution(Execution):
@@ -215,13 +245,16 @@ class ParallelExecution(Execution):
         res = jax.block_until_ready(
             jax.pmap(self.map_model, in_axes=0)(self.diff_state)
         )
-        return ParallelResult(res, self.space.N, self.n_vmap, self.n_pmap)
+        return ParallelResult(
+            res, self.space.N, self.n_vmap, self.n_pmap, space=self.space
+        )
 
 
 class ParallelResult(Result):
-    def __init__(self, results, N, n_vmap, n_pmap):
+    def __init__(self, results, N, n_vmap, n_pmap, space=None):
         self.results = results
         self.N = N
+        self.space = space
         self.n_vmap = n_vmap
         self.n_pmap = n_pmap
 
@@ -266,3 +299,17 @@ class ParallelResult(Result):
                 return leaf[pmap_idx, second_dim_idx]
 
         return jax.tree.map(extract_at_indices, self.results)
+
+    def to_dataframe(self) -> pd.DataFrame:
+        df = self.space.to_dataframe() if self.space is not None else pd.DataFrame()
+        col_names = self._result_col_names(df.columns)
+
+        def unbatch(leaf):
+            if self.n_pmap is not None:
+                # (n_pmap, n_map, ...) → (n_pmap * n_map, ...)
+                leaf = leaf.reshape((-1,) + leaf.shape[2:])
+            # trim padding to N
+            return np.asarray(leaf[: self.N])
+
+        leaves = jax.tree.leaves(jax.tree.map(unbatch, self.results))
+        return self._assign_leaves(df, col_names, leaves)

@@ -14,45 +14,375 @@ from plum import dispatch
 
 from .core.bunch import Bunch
 from .core.network import Network
-from .result import wrap_native_result
+from .dynamics.base import AbstractDynamics
+from .result import DiffraxSolution, wrap_native_result
 from .solvers.diffrax import DiffraxSolver
 from .solvers.native import NativeSolver
 
 
+def _snapshot(tree):
+    """Structurally copy a PyTree's containers, sharing leaves.
+
+    Rebuilds every PyTree container (Bunch, dataclass, equinox Module, ...)
+    so mutations to the returned tree don't leak back to ``tree``. Leaves
+    (arrays, scalars, PRNG keys) are immutable in JAX, so sharing them is
+    safe and avoids duplicating large arrays (graph weights, history
+    buffers, pre-sampled noise tensors).
+    """
+    return jax.tree.map(lambda x: x, tree)
+
+
+def _checkpointed_scan(op, state0, scan_inputs, n_steps, block_size):
+    """Run ``op`` over ``scan_inputs`` as an outer-checkpointed nested scan.
+
+    The leading axis of every leaf in ``scan_inputs`` is split into
+    ``(n_blocks, block_size)``; an outer ``jax.lax.scan`` runs over blocks
+    with each block wrapped in ``jax.checkpoint``, and an inner
+    ``jax.lax.scan`` runs the ``block_size`` steps inside a block. When
+    ``n_steps`` is not a multiple of ``block_size`` the remainder runs through
+    a plain (uncheckpointed) tail scan; the tail length is fixed at trace
+    time and is at most ``block_size - 1``.
+
+    Output of the scanned computation is stitched back to leading shape
+    ``(n_steps, ...)`` so the result is indistinguishable from a single
+    ``jax.lax.scan(op, state0, scan_inputs)`` call to downstream code.
+    """
+    n_blocks = n_steps // block_size
+    remainder = n_steps - n_blocks * block_size
+
+    def inner(state, block_inputs):
+        return jax.lax.scan(op, state, block_inputs)
+
+    ckpt_inner = jax.checkpoint(inner)
+
+    if n_blocks > 0:
+        main = jax.tree.map(
+            lambda x: x[: n_blocks * block_size].reshape(
+                (n_blocks, block_size) + x.shape[1:]
+            ),
+            scan_inputs,
+        )
+        state_mid, outs_main = jax.lax.scan(ckpt_inner, state0, main)
+        outs_main_flat = jax.tree.map(
+            lambda x: x.reshape((n_blocks * block_size,) + x.shape[2:]),
+            outs_main,
+        )
+    else:
+        state_mid = state0
+        outs_main_flat = None
+
+    if remainder == 0:
+        return state_mid, outs_main_flat
+
+    tail = jax.tree.map(lambda x: x[n_blocks * block_size :], scan_inputs)
+    # Wrap the tail in jax.checkpoint too so its activation tape is not
+    # held live during the outer backward through the main blocks. Without
+    # this, peak memory for non-divisor K becomes
+    # ``K · c_inner + remainder · c_unchecked`` and large remainders can
+    # spike above the no-checkpoint baseline.
+    state_final, outs_tail = jax.checkpoint(
+        lambda s, t: jax.lax.scan(op, s, t)
+    )(state_mid, tail)
+
+    if outs_main_flat is None:
+        return state_final, outs_tail
+
+    outs = jax.tree.map(
+        lambda a, b: jnp.concatenate([a, b], axis=0), outs_main_flat, outs_tail
+    )
+    return state_final, outs
+
+
+def _make_diffusion_matrix_fn(diffusion_fn, state_indices, n_states, n_nodes):
+    """Build a vectorized diffusion-matrix closure for Diffrax SDE integration.
+
+    Returns ``compute_diffusion_matrix(t, y, noise_params) -> [n_states, n_nodes, n_brownian]``
+    where ``n_brownian = len(state_indices) * n_nodes``. The Brownian vector is laid
+    out so that index ``i * n_nodes + j`` drives state ``state_indices[i]`` on node ``j``.
+
+    Accepts a diffusion callable returning either a scalar, a per-noise-state 1-D
+    array, or a full ``[n_noise_states, n_nodes]`` array; broadcasts accordingly.
+    """
+    state_indices_arr = jnp.asarray(state_indices)
+    n_noise_states = len(state_indices)
+    n_brownian = n_noise_states * n_nodes
+    i_idx = jnp.arange(n_noise_states)[:, None]
+    j_idx = jnp.arange(n_nodes)[None, :]
+    brownian_idx = i_idx * n_nodes + j_idx
+    state_idx_b = state_indices_arr[:, None]
+
+    def compute_diffusion_matrix(t, y, noise_params):
+        g_raw = diffusion_fn(t, y, noise_params)
+        if jnp.ndim(g_raw) == 0:
+            g = jnp.full((n_noise_states, n_nodes), g_raw)
+        elif jnp.ndim(g_raw) == 1:
+            g = jnp.broadcast_to(g_raw[..., None], (n_noise_states, n_nodes))
+        else:
+            g = g_raw
+        diffusion_matrix = jnp.zeros((n_states, n_nodes, n_brownian))
+        return diffusion_matrix.at[state_idx_b, j_idx, brownian_idx].set(g)
+
+    return compute_diffusion_matrix
+
+
+_PREPARE_DOC = """Prepare a dynamics model for simulation.
+
+Transforms a model into a JAX-compiled simulation function and a corresponding
+configuration PyTree. Dispatches on the first two arguments via ``plum``:
+
+==========================  ================  ======================================
+model                       solver            supports
+==========================  ================  ======================================
+``Network``                 ``NativeSolver``  full feature set: delays, noise,
+                                              external inputs, auxiliaries, VOI
+``Network``                 ``DiffraxSolver`` stateless couplings only; no delays,
+                                              no auxiliaries, no VOI filtering
+``AbstractDynamics``        ``NativeSolver``  uncoupled multi-node with optional
+                                              noise and external inputs
+``AbstractDynamics``        ``DiffraxSolver`` uncoupled multi-node with optional
+                                              noise and external inputs, no VOI
+==========================  ================  ======================================
+
+Parameters
+----------
+model : Network or AbstractDynamics
+    Either a full ``Network`` (dynamics + couplings + graph + optional noise/
+    externals) or a bare ``AbstractDynamics`` for uncoupled simulation.
+solver : NativeSolver or DiffraxSolver
+    Integration method. ``NativeSolver`` (Euler, Heun) uses fixed-step
+    ``jax.lax.scan`` and supports every feature. ``DiffraxSolver`` wraps
+    ``diffrax.diffeqsolve`` for adaptive stepping but is restricted to
+    stateless couplings (see Diffrax limitations below).
+t0 : float, optional
+    Start time. Default ``0.0``.
+t1 : float, optional
+    End time. Default ``1.0``. For native solvers ``t1`` is included in the
+    save grid; for Diffrax the save grid is governed by ``solver.saveat``.
+dt : float, optional
+    Time step. Default ``0.1``. Fixed step for ``NativeSolver``; initial step
+    ``dt0`` for ``DiffraxSolver``'s adaptive controller.
+n_nodes : int, optional
+    **Bare-dynamics dispatch only.** Number of uncoupled nodes. Default ``1``.
+    Passing this with a ``Network`` raises a dispatch error.
+noise : AbstractNoise, optional
+    **Bare-dynamics dispatch only.** Stochastic process. For ``Network``,
+    noise is attached to the network itself.
+externals : dict, optional
+    **Bare-dynamics dispatch only.** Mapping ``{name: AbstractExternalInput}``.
+    For ``Network``, externals live on the network.
+
+Returns
+-------
+solve_function : Callable
+    Pure JAX function ``solve_function(config) -> result``. JIT-safe and
+    compatible with ``jax.grad``, ``jax.vmap``, and ``jax.pmap``.
+config : Bunch
+    Configuration PyTree. Keys depend on dispatch but always include
+    ``dynamics`` (params), ``initial_state``, and ``_internal`` (precomputed
+    static data). Network dispatches additionally carry ``coupling``,
+    ``external``, ``graph``, and — if stochastic — ``noise`` (params plus
+    a ``key`` field driving in-scan noise generation on the native path),
+    with an optional ``_internal.noise_samples`` slot for injecting a
+    pre-sampled trajectory.
+
+    For stochastic networks on the native path, ``config.noise`` carries
+    both the parameter Bunch (e.g. ``sigma``) and ``config.noise.key`` —
+    the PRNG key consumed by the in-scan noise generator. The optional
+    slot ``config._internal.noise_samples`` defaults to ``None`` and can
+    be set to a pre-sampled trajectory of shape ``[n_steps,
+    n_noise_states, n_nodes]`` to override generation (used by NumPyro
+    workflows that treat the Brownian increments as latents).
+
+    The returned ``result`` is a ``NativeSolution`` (native solvers) or a
+    ``DiffraxSolution`` (Diffrax). Both expose ``.ts``, ``.ys``,
+    ``.variable_names``, and ``.dt``.
+
+Raises
+------
+ValueError
+    If ``DiffraxSolver`` is used with a network whose ``max_delay > 0``.
+    Diffrax cannot maintain history buffers across its internal loop.
+
+Notes
+-----
+**Config isolation from the source model.** The returned ``config`` is a
+structural snapshot: PyTree containers are rebuilt fresh, leaves are
+shared. Mutating ``config`` (e.g. ``config.dynamics.G = 0.5``, or
+attaching a ``GridAxis`` for a sweep) does not leak back into the source
+``Network``/``AbstractDynamics``, and a subsequent ``prepare()`` returns
+the original values. Sharing leaves is safe (JAX arrays are immutable)
+and avoids duplicating large data like graph weights or history buffers.
+
+**Native solver time grid.** Native solvers scan over
+``arange(t0, t1, dt)`` and emit the post-step state on each iteration, so
+the returned ``result.ts`` is the half-open grid ``(t0, t1]``:
+``[t0 + dt, t0 + 2*dt, ..., t1]`` with ``(t1 - t0) / dt`` samples. The
+initial state at ``t0`` is *not* included; ``t1`` *is*. ``t1 - t0`` must be
+an integer multiple of ``dt`` for the grid to land exactly on ``t1``.
+Diffrax uses ``solver.saveat`` instead.
+
+**Diffrax limitations.** The Diffrax dispatches are experimental and
+intentionally narrower than the native ones:
+
+- Delayed couplings are rejected (``max_delay > 0`` raises ``ValueError``).
+- Auxiliary outputs from ``dynamics_fn`` are discarded — Diffrax vector
+  fields must be pure ``dy/dt``.
+- ``VARIABLES_OF_INTEREST`` is **ignored**. The returned ``ys`` always has
+  shape ``[n_time, N_STATES, n_nodes]`` and ``variable_names`` always equals
+  ``STATE_NAMES``. Use ``NativeSolver`` if you need VOI filtering or
+  auxiliaries.
+- ``effective_save_dt`` is inferred as ``saveat.ts[1] - saveat.ts[0]`` and
+  is only meaningful for uniform ``SaveAt(ts=...)``. Downstream monitors
+  that rely on a scalar ``dt`` will be wrong for non-uniform save grids.
+
+**Noise generation (native path).** The full Brownian-increment tensor
+of shape ``[n_steps, n_noise_states, n_nodes]`` is materialised inside
+``solve_function`` on every call, via a single
+``jax.random.normal(config.noise.key, ...)`` that XLA fuses with the
+downstream scan. To scan over seeds, vary ``config.noise.key`` (e.g.
+with ``eqx.tree_at`` and ``jax.vmap``); no re-``prepare`` needed.
+Reseeding the noise object after ``prepare`` has no effect —
+``config.noise.key`` is the live source of randomness.
+
+For workflows that supply increments explicitly (NumPyro inference over
+Brownian increments, replay of a recorded trajectory, common random
+numbers across a sequential parameter sweep), set
+``config._internal.noise_samples`` to an array of shape ``[n_steps,
+n_noise_states, n_nodes]``. The trace-time branch on this field
+bypasses the in-call PRNG; flipping between ``None`` and an array
+triggers a one-time JIT retrace per ``solve_function``.
+
+**Noise generation (Diffrax path).** The ``VirtualBrownianTree`` is
+constructed inside ``solve_function`` from ``config.noise.key``, so
+the seed-swap workflow used on the native path works identically here:
+vary ``config.noise.key`` (e.g. with ``eqx.tree_at`` and ``jax.vmap``)
+to scan over noise realisations without re-``prepare``-ing. There is
+no injection slot on this dispatch — ``config._internal.noise_samples``
+is native-only because Diffrax controls are evaluated lazily by the
+solver (including at sub-step times for adaptive stages), and a fixed
+pre-sampled array cannot service those queries.
+
+**optax / grad note.** Because ``config.noise.key`` is a PRNG-key leaf
+sitting inside ``config.noise`` next to numeric parameters, any
+optimiser or gradient transformation applied to that subtree must
+either skip non-float leaves or operate on a filtered view (e.g.
+``eqx.partition``). The diffusion callback itself only touches numeric
+fields, so this is purely a concern for callers that pass
+``config.noise`` wholesale into ``optax``.
+
+**Preparation steps (native).**
+
+1. Prepare all couplings, building history buffers for delays if needed.
+2. Prepare external inputs.
+3. Pre-generate noise samples if stochastic (one per timestep).
+4. Pre-compile coupling/external compute and state-update closures to
+   avoid dict iteration inside the scan.
+5. Return a pure function wrapping ``jax.lax.scan``.
+
+**Preparation steps (Diffrax).**
+
+1. Validate no delays.
+2. Build stateless coupling/external data.
+3. Construct the ``diffrax.ODETerm`` drift and, if stochastic, a
+   ``ControlTerm`` over a ``VirtualBrownianTree``.
+4. Return a pure function wrapping ``diffrax.diffeqsolve``.
+
+**Solver selection.** Use ``NativeSolver`` for anything with delays, noise
+interacting with history, VOI filtering, or auxiliary recording. Use
+``DiffraxSolver`` for stiff stateless systems where adaptive stepping pays
+off.
+
+Examples
+--------
+Network with native solver (all features):
+
+>>> from tvboptim.experimental.network_dynamics import Network, prepare
+>>> from tvboptim.experimental.network_dynamics.dynamics import ReducedWongWang
+>>> from tvboptim.experimental.network_dynamics.solvers import Euler
+>>> from tvboptim.experimental.network_dynamics.coupling import LinearCoupling
+>>> from tvboptim.experimental.network_dynamics.graph import DenseGraph
+>>> import jax.numpy as jnp
+>>> network = Network(ReducedWongWang(),
+...                   LinearCoupling(incoming_states='S', G=1.0),
+...                   DenseGraph(jnp.ones((68, 68))))
+>>> model_fn, config = prepare(network, Euler(), t0=0, t1=100, dt=0.1)
+>>> result = model_fn(config)
+
+Network with Diffrax (no delays, no VOI, no auxiliaries):
+
+>>> import diffrax
+>>> from tvboptim.experimental.network_dynamics.solvers import DiffraxSolver
+>>> solver = DiffraxSolver(diffrax.Tsit5(),
+...                        saveat=diffrax.SaveAt(ts=jnp.arange(0, 100, 0.1)))
+>>> model_fn, config = prepare(network, solver, t0=0, t1=100, dt=0.1)
+
+Bare dynamics, uncoupled multi-node:
+
+>>> from tvboptim.experimental.network_dynamics.dynamics import JansenRit
+>>> from tvboptim.experimental.network_dynamics.solvers import Heun
+>>> model_fn, config = prepare(JansenRit(), Heun(), t0=0, t1=1.0, dt=1e-3,
+...                            n_nodes=3)
+
+Modifying parameters between runs (config is a PyTree):
+
+>>> import copy
+>>> cfg2 = copy.deepcopy(config)
+>>> cfg2.dynamics.G = 2.5
+>>> result2 = model_fn(cfg2)
+
+See Also
+--------
+solve : Thin wrapper that calls ``prepare`` and executes immediately.
+Network : Network dynamics container.
+NativeSolver : Fixed-step integrators (Euler, Heun).
+DiffraxSolver : Adaptive-step integrators via Diffrax.
+"""
+
+
 def solve(
-    network: Network,
-    solver: NativeSolver,
+    model,
+    solver,
     t0: float = 0.0,
     t1: float = 100.0,
     dt: float = 0.1,
+    **kwargs,
 ):
-    """Main entry point for network simulation.
+    """Main entry point for simulation.
+
+    Accepts either a Network or a bare AbstractDynamics instance.
+    Dispatches to the appropriate prepare() overload via plum.
 
     Args:
-        network: Network instance with multi-coupling support
-        solver: NativeSolver instance (Euler, Heun, etc.)
+        model: Network or AbstractDynamics instance
+        solver: NativeSolver or DiffraxSolver instance
         t0: Start time
-        t1: End time
+        t1: End time (inclusive for native solvers — see note on time grid)
         dt: Time step
+        **kwargs: Additional arguments forwarded to prepare()
+            (e.g. n_nodes for bare dynamics)
 
     Returns:
         Simulation results wrapped in result object
 
-    Example:
-        >>> from network_dynamics import Network, solve
-        >>> from network_dynamics.solvers import Euler
-        >>> from network_dynamics.dynamics import Lorenz
-        >>> from network_dynamics.coupling import LinearCoupling
-        >>> from network_dynamics.graph import Graph
-        >>>
-        >>> dynamics = Lorenz()
-        >>> coupling = LinearCoupling(incoming_states='x', G=1.0)
-        >>> graph = Graph(weights)
-        >>> network = Network(dynamics, coupling, graph)
-        >>>
+    Notes:
+        Native solvers use the half-open scan grid ``arange(t0, t1, dt)`` and
+        emit the post-step state on each iteration, so the returned save grid
+        is ``(t0, t1]``: ``result.ts = [t0 + dt, t0 + 2*dt, ..., t1]``, with the
+        initial state at ``t0`` excluded and the endpoint ``t1`` included.
+        The number of saved samples is ``(t1 - t0) / dt``. ``t1 - t0`` must be
+        an integer multiple of ``dt`` for the grid to land exactly on ``t1``.
+
+    Examples:
+        >>> # With Network
         >>> result = solve(network, Euler(), t0=0, t1=10, dt=0.01)
+
+        >>> # With bare dynamics (single node)
+        >>> result = solve(JansenRit(), Heun(), t0=0, t1=1.0, dt=0.001)
+
+        >>> # With bare dynamics (multi-node uncoupled)
+        >>> result = solve(JansenRit(), Heun(), t0=0, t1=1.0, dt=0.001, n_nodes=3)
     """
-    solve_fn, params = prepare(network, solver, t0=t0, t1=t1, dt=dt)
+    solve_fn, params = prepare(model, solver, t0=t0, t1=t1, dt=dt, **kwargs)
     return solve_fn(params)
 
 
@@ -64,211 +394,29 @@ def prepare(
     t1: float = 1.0,
     dt: float = 0.1,
 ) -> Tuple[Callable, Bunch]:
-    """Prepare network dynamics model for simulation.
+    """Compile a model into a pure JAX solve function and a config PyTree.
 
-    Transforms a network dynamics model into a JAX-compiled simulation function
-    and corresponding configuration object. Supports both native solvers (Euler, Heun)
-    and Diffrax solvers with different feature sets and performance characteristics.
-
-    The preparation process optimizes the model for efficient execution by pre-compiling
-    closures, pre-allocating buffers, and structuring data for JAX transformations.
+    Builds per-dispatch data (coupling buffers, noise samples, external
+    inputs) and returns ``(solve_fn, config)`` where ``solve_fn(config)``
+    runs the integration. Dispatches on the first two arguments via
+    ``plum``: ``Network``/``AbstractDynamics`` paired with
+    ``NativeSolver``/``DiffraxSolver``.
 
     Parameters
     ----------
-    network : Network
-        Network dynamics model containing:
-
-        - **dynamics** : Neural mass/population model (e.g., ReducedWongWang, JansenRit)
-        - **couplings** : Inter-region coupling functions (can be delayed or instantaneous)
-        - **graph** : Connectivity structure (weights, delays, distances)
-        - **noise** : Optional stochastic process (additive/multiplicative)
-        - **externals** : Optional external inputs (e.g., stimulation)
-
-    solver : NativeSolver or DiffraxSolver
-        Integration method. Two solver families available:
-
-        **NativeSolver** (Euler, Heun):
-            - Fixed time step integration
-            - Supports **all features**: delays, noise, stateful operations
-            - Optimized for jax.lax.scan
-            - Best for most brain network simulations
-
-        **DiffraxSolver** (Tsit5, Dopri5, etc.):
-            - Adaptive time stepping
-            - **Stateless only**: no delayed coupling, no history buffers
-            - Useful for stiff ODEs or when adaptive stepping is required
-            - Raises ValueError if network has delays
-
-    t0 : float, optional
-        Simulation start time, by default 0.0
-    t1 : float, optional
-        Simulation end time, by default 1.0
-    dt : float, optional
-        Integration time step, by default 0.1
-
-        - For NativeSolver: Fixed step size used throughout simulation
-        - For DiffraxSolver: Initial step size (dt0) for adaptive controller
+    t0, t1, dt : float
+        Integration interval and step size. ``dt`` is the fixed step for
+        native solvers and the initial step for Diffrax.
 
     Returns
     -------
-    solve_function : Callable
-        Pure JAX function for running simulation.
+    (Callable, Bunch)
+        Pure solve function and its runtime configuration PyTree.
 
-        Signature: ``solve_function(config) -> results``
-
-        The function is JIT-compiled and supports:
-
-        - Automatic differentiation (jax.grad, jax.jacobian)
-        - Vectorization (jax.vmap)
-        - Parallel execution (jax.pmap)
-
-    config : Bunch
-        Configuration PyTree containing:
-
-        - **dynamics** : Dynamics model parameters
-        - **coupling** : Coupling parameters (one entry per coupling)
-        - **external** : External input parameters (one entry per input)
-        - **noise** : Noise parameters (if stochastic)
-        - **graph** : Graph structure (weights, delays)
-        - **initial_state** : Initial conditions [n_states, n_nodes]
-        - **_internal** : Precomputed data (coupling indices, noise samples, etc.)
-
-    Raises
-    ------
-    ValueError
-        If using DiffraxSolver with delayed coupling (network.max_delay > 0).
-        Diffrax solvers cannot maintain history buffers due to internal loop control.
-
-    Examples
-    --------
-    **Basic Usage with Native Solver**
-
-    >>> from tvboptim.experimental.network_dynamics import Network, prepare
-    >>> from tvboptim.experimental.network_dynamics.dynamics import ReducedWongWang
-    >>> from tvboptim.experimental.network_dynamics.solvers import Euler
-    >>> from tvboptim.experimental.network_dynamics.coupling import LinearCoupling
-    >>> from tvboptim.experimental.network_dynamics.graph import DenseGraph
-    >>> import jax.numpy as jnp
-    >>>
-    >>> # Create network components
-    >>> dynamics = ReducedWongWang()
-    >>> coupling = LinearCoupling(incoming_states='S', G=1.0)
-    >>> weights = jnp.ones((68, 68))  # 68 brain regions
-    >>> graph = DenseGraph(weights)
-    >>>
-    >>> # Build network
-    >>> network = Network(dynamics, coupling, graph)
-    >>>
-    >>> # Prepare for simulation
-    >>> model_fn, config = prepare(network, Euler(), t0=0, t1=100, dt=0.1)
-    >>>
-    >>> # Run simulation
-    >>> results = model_fn(config)
-    >>> print(results.data.shape)  # [n_timesteps, n_voi, n_nodes]
-
-    **With Delayed Coupling (Native Solver Only)**
-
-    >>> from tvboptim.experimental.network_dynamics.coupling import DelayedLinearCoupling
-    >>> from tvboptim.experimental.network_dynamics.graph import DenseDelayGraph
-    >>>
-    >>> # Create graph with heterogeneous delays
-    >>> delays = jnp.array([...])  # [n_nodes, n_nodes] delay matrix in ms
-    >>> graph = DenseDelayGraph(weights, delays)
-    >>>
-    >>> # Delayed coupling requires history buffer
-    >>> coupling = DelayedLinearCoupling(incoming_states='S', G=2.0)
-    >>> network = Network(dynamics, coupling, graph)
-    >>>
-    >>> # Only NativeSolver supports delays
-    >>> model_fn, config = prepare(network, Euler(), t0=0, t1=100, dt=0.1)
-
-    **With Adaptive Stepping (Diffrax Solver)**
-
-    >>> from tvboptim.experimental.network_dynamics.solvers import DiffraxSolver
-    >>> import diffrax
-    >>>
-    >>> # Diffrax solver with adaptive time stepping
-    >>> solver = DiffraxSolver(
-    ...     diffrax.Tsit5(),
-    ...     saveat=diffrax.SaveAt(ts=jnp.arange(0, 100, 0.1))
-    ... )
-    >>>
-    >>> # Network must NOT have delays for Diffrax
-    >>> network = Network(dynamics, LinearCoupling(...), graph)
-    >>> model_fn, config = prepare(network, solver, t0=0, t1=100, dt=0.1)
-    >>> solution = model_fn(config)  # Returns diffrax.Solution object
-
-    **With Stochastic Dynamics**
-
-    >>> from tvboptim.experimental.network_dynamics.noise import AdditiveNoise
-    >>> import jax
-    >>>
-    >>> # Add noise to network
-    >>> noise = AdditiveNoise(state_indices=[0], sigma=0.01, key=jax.random.PRNGKey(0))
-    >>> network = Network(dynamics, coupling, graph, noise=noise)
-    >>>
-    >>> # Prepare with noise (pre-generates noise samples)
-    >>> model_fn, config = prepare(network, Euler(), t0=0, t1=100, dt=0.1)
-
-    **Modifying Parameters**
-
-    >>> # Config is a PyTree - parameters can be modified
-    >>> import copy
-    >>> config_modified = copy.deepcopy(config)
-    >>> config_modified.dynamics.G = 2.5  # Change global coupling
-    >>> config_modified.coupling.default.G = 1.5  # Change coupling strength
-    >>>
-    >>> # Run with modified parameters
-    >>> results_modified = model_fn(config_modified)
-
-    Notes
-    -----
-    **Preparation Steps (NativeSolver):**
-
-    1. Prepare all couplings (create history buffers for delays if needed)
-    2. Build config structure with flattened parameters and graph
-    3. Pre-generate noise samples if stochastic (one sample per timestep)
-    4. Pre-compile coupling computation closures (avoid dict lookups in scan)
-    5. Pre-compile state update closures (for history buffer management)
-    6. Return pure function optimized for jax.lax.scan
-
-    **Preparation Steps (DiffraxSolver):**
-
-    1. Validate network has no delays (raises ValueError if found)
-    2. Prepare stateless coupling/external input data
-    3. Build config with parameters and precomputed data
-    4. Create Diffrax vector field and control term (for SDEs)
-    5. Return pure function wrapping diffrax.diffeqsolve
-
-    **Solver Selection Guidelines:**
-
-    Use **NativeSolver** (Euler, Heun) when:
-
-    - Network has delayed coupling
-    - Need full control over integration loop
-    - Want optimal performance with jax.lax.scan
-    - Standard brain network simulation
-
-    Use **DiffraxSolver** when:
-
-    - Network has no delays (stateless)
-    - Need adaptive time stepping for stiff systems
-    - Want access to advanced Diffrax features
-    - Require error control and step size adaptation
-
-    **Performance Notes:**
-
-    - Native solvers use jax.lax.scan for optimal compile-time optimization
-    - Pre-compilation of closures eliminates runtime overhead
-    - History buffers for delays use efficient circular indexing
-    - Noise samples are pre-generated to avoid per-step RNG calls
-
-    See Also
-    --------
-    solve : High-level interface that calls prepare() and executes immediately
-    Network : Network dynamics model container
-    NativeSolver : Fixed-step integration methods (Euler, Heun)
-    DiffraxSolver : Adaptive-step integration using Diffrax library
+    See ``help(prepare)`` or ``prepare.__doc__`` for the full reference,
+    including per-dispatch parameters (``n_nodes``, ``noise``, ``externals``
+    for bare dynamics) and Diffrax limitations (no delays, no auxiliaries,
+    no VOI filtering).
     """
     # Prepare all couplings (creates history buffers, computes indices, etc.)
     coupling_data_dict, coupling_state_dict_init = network.prepare(dt, t0, t1)
@@ -279,14 +427,16 @@ def prepare(
     # Time array
     time_steps = jnp.arange(t0, t1, dt)
 
-    # Build new config structure
+    # Build new config structure. Param/graph subtrees are snapshotted so
+    # user mutations to the returned config don't leak back into the source
+    # network (or contaminate later prepare() calls).
     config = Bunch(
         # Parameters (flattened - no params. prefix)
-        dynamics=network.dynamics.params,
+        dynamics=_snapshot(network.dynamics.params),
         coupling=Bunch(),
         external=Bunch(),
         # Graph (PyTree object)
-        graph=network.graph,
+        graph=_snapshot(network.graph),
         # Initial state
         initial_state=Bunch(
             dynamics=network.initial_state,
@@ -302,23 +452,24 @@ def prepare(
     )
 
     # Add coupling params
-    for name, coupling in network.couplings.items():
-        config.coupling[name] = coupling.params
+    for name, coupling in network.coupling.items():
+        config.coupling[name] = _snapshot(coupling.params)
 
     # Add external input params
     for name, external in network.externals.items():
-        config.external[name] = external.params
+        config.external[name] = _snapshot(external.params)
 
-    # Add noise params and samples if stochastic
+    # Add noise params and (optional) sample-injection slot if stochastic.
+    # By default the full Brownian-increment tensor is materialised inside
+    # _f via a single jax.random.normal(config.noise.key, ...) call, which
+    # XLA fuses with the downstream scan. Users who want to inject a
+    # pre-sampled trajectory (e.g. for NumPyro inference over Brownian
+    # increments) can populate config._internal.noise_samples; the scan
+    # branches on its presence at trace time.
     if network.noise is not None:
-        config.noise = network.noise.params
-        n_steps = len(time_steps)
-        n_nodes = network.graph.n_nodes
-        n_noise_states = len(network.noise._state_indices)
-        noise_shape = (n_steps, n_noise_states, n_nodes)
-        config._internal.noise_samples = network.noise.generate_noise_samples(
-            noise_shape
-        )
+        config.noise = _snapshot(network.noise.params)
+        config.noise.key = network.noise.key
+        config._internal.noise_samples = None
 
     # =========================================================================
     # PRE-COMPILE COUPLING COMPUTATION CLOSURE
@@ -328,36 +479,47 @@ def prepare(
     coupling_names_ordered = []
     for name in network.dynamics.COUPLING_INPUTS.keys():
         coupling_names_ordered.append(name)
-        if name in network.couplings:
-            coupling = network.couplings[name]
+        if name in network.coupling:
+            coupling = network.coupling[name]
             data = coupling_data_dict[name]
             coupling_list.append((name, coupling, data))
         else:
             coupling_list.append((name, None, None))
 
     n_nodes = network.graph.n_nodes
-    graph = network.graph  # Capture graph for closure
+    n_noise_states = (
+        len(network.noise._state_indices) if network.noise is not None else 0
+    )
 
-    def compute_all_couplings(t, network_state, coupling_state_dict, config):
+    def compute_all_couplings(
+        t, network_state, coupling_state_dict, config, coupling_data_dict
+    ):
         """Pre-compiled closure for coupling computation.
 
         Avoids method calls and dict iterations in scan loop.
 
         Args:
             config: Config containing coupling parameters to use
+            coupling_data_dict: Per-coupling data (enriched by precompute if applicable)
         """
         coupling_inputs = Bunch()
 
-        for name, coupling, data in coupling_list:
+        for name, coupling, _ in coupling_list:
             if coupling is None:
                 # Missing coupling - use zeros
                 n_dims = network.dynamics.COUPLING_INPUTS[name]
                 coupling_inputs[name] = jnp.zeros((n_dims, n_nodes))
             else:
-                # Compute coupling using pre-fetched data and graph
+                # Compute coupling using enriched data and graph
+                data = coupling_data_dict[name]
                 state_data = coupling_state_dict[name]
                 coupling_inputs[name] = coupling.compute(
-                    t, network_state, data, state_data, config.coupling[name], graph
+                    t,
+                    network_state,
+                    data,
+                    state_data,
+                    config.coupling[name],
+                    config.graph,
                 )
 
         return coupling_inputs
@@ -367,18 +529,21 @@ def prepare(
     # =========================================================================
     # Build list of couplings that need state updates (avoid dict iteration)
     update_list = [
-        (name, network.couplings[name], coupling_data_dict[name])
-        for name in network.couplings.keys()
+        (name, network.coupling[name], coupling_data_dict[name])
+        for name in network.coupling.keys()
     ]
 
-    def update_all_coupling_states(coupling_state_dict, new_network_state):
+    def update_all_coupling_states(
+        coupling_state_dict, new_network_state, coupling_data_dict
+    ):
         """Pre-compiled closure for coupling state updates.
 
         Avoids method calls and dict iterations in scan loop.
         """
         new_states = Bunch()
 
-        for name, coupling, data in update_list:
+        for name, coupling, _ in update_list:
+            data = coupling_data_dict[name]
             new_states[name] = coupling.update_state(
                 data,
                 coupling_state_dict[name],
@@ -386,6 +551,18 @@ def prepare(
             )
 
         return new_states
+
+    def precompute_all_couplings(config):
+        """Call precompute() for each coupling. Runs inside JIT, once per forward pass."""
+        enriched = {}
+        for name, coupling, static_data in coupling_list:
+            if coupling is not None:
+                enriched[name] = coupling.precompute(
+                    static_data, config.coupling[name], config.graph
+                )
+            else:
+                enriched[name] = None
+        return enriched
 
     # =========================================================================
     # PRE-COMPILE EXTERNAL INPUT COMPUTATION CLOSURE
@@ -473,9 +650,42 @@ def prepare(
     # Flag: do we need to record any auxiliaries?
     record_auxiliaries = len(aux_voi_indices) > 0
 
+    # Variable names that label axis 1 of the output trajectory.
+    # Ordering mirrors the concatenation below: selected states, then selected auxiliaries.
+    _all_variable_names = network.dynamics.all_variable_names
+    variable_names = tuple(
+        _all_variable_names[i] for i in voi_indices if i < n_states
+    ) + tuple(_all_variable_names[i] for i in voi_indices if i >= n_states)
+
+    # Static shape for the full per-call noise tensor.
+    n_steps = len(time_steps)
+    noise_samples_shape = (n_steps, n_noise_states, n_nodes)
+
     def _f(config):
         """Pure integration function."""
         state0 = config.initial_state
+
+        # Run precompute() for all couplings once before the scan.
+        # This allows parameter-dependent quantities (e.g. W_eff = W * wLRE) to
+        # be computed with gradient flow while avoiding per-step redundancy.
+        enriched = precompute_all_couplings(config)
+
+        # Materialize the full noise trajectory once per call. Trace-time
+        # branch: if the injection slot is None, sample from config.noise.key
+        # in a single PRNG call (XLA fuses this with the downstream scan);
+        # otherwise use the user-provided tensor verbatim. This avoids the
+        # per-step PRNG cost of an in-scan fold_in while preserving the
+        # seed-scan API (vary config.noise.key per call) and the injection
+        # path (set config._internal.noise_samples).
+        if network.noise is not None:
+            if config._internal.noise_samples is None:
+                noise_samples_all = jax.random.normal(
+                    config.noise.key, noise_samples_shape
+                )
+            else:
+                noise_samples_all = config._internal.noise_samples
+        else:
+            noise_samples_all = None
 
         def op(state, inputs):
             """Single integration step.
@@ -500,7 +710,7 @@ def prepare(
             def wrapped_dynamics(t_inner, network_state, params_dynamics):
                 # Compute all coupling inputs using pre-compiled closure
                 coupling_inputs = compute_all_couplings(
-                    t_inner, network_state, state.coupling, config
+                    t_inner, network_state, state.coupling, config, enriched
                 )
                 # Compute all external inputs using pre-compiled closure
                 external_inputs = compute_all_externals(
@@ -519,8 +729,8 @@ def prepare(
             # Prepare noise sample if stochastic
             noise_sample = jnp.zeros_like(state.dynamics)
             if network.noise is not None:
-                # Get pre-generated noise for this timestep
-                noise = config._internal.noise_samples[step_idx]
+                # Single indexed read into the per-call noise tensor.
+                noise = noise_samples_all[step_idx]
 
                 # Compute diffusion coefficient
                 diffusion = network.noise.diffusion(t, state.dynamics, config.noise)
@@ -542,7 +752,7 @@ def prepare(
 
             # Use pre-compiled closure for coupling state updates
             next_coupling_state_dict = update_all_coupling_states(
-                state.coupling, next_dynamics_state
+                state.coupling, next_dynamics_state, enriched
             )
 
             # Use pre-compiled closure for external state updates
@@ -583,11 +793,20 @@ def prepare(
             # SDE/SDDE: time + step index for noise lookup
             scan_inputs = jnp.stack([time_steps, jnp.arange(len(time_steps))], axis=1)
 
-        # Run integration
-        _, res = jax.lax.scan(op, state0, scan_inputs)
+        # Run integration. When checkpoint_every is None we go through the
+        # original single-scan path verbatim to guarantee no performance
+        # regression for the default setting; otherwise switch to an
+        # outer-checkpointed nested scan that trades ~2x recompute on the
+        # backward pass for ~O(n_steps/K + K) backward memory.
+        if solver.checkpoint_every is None:
+            _, res = jax.lax.scan(op, state0, scan_inputs)
+        else:
+            _, res = _checkpointed_scan(
+                op, state0, scan_inputs, n_steps, solver.checkpoint_every
+            )
 
         # Wrap result for consistency
-        return wrap_native_result(res, t0, t1, dt)
+        return wrap_native_result(res, t0, t1, dt, variable_names=variable_names)
 
     return _f, config
 
@@ -600,211 +819,29 @@ def prepare(
     t1: float = 1.0,
     dt: float = 0.1,
 ) -> Tuple[Callable, Bunch]:
-    """Prepare network dynamics model for simulation.
+    """Compile a model into a pure JAX solve function and a config PyTree.
 
-    Transforms a network dynamics model into a JAX-compiled simulation function
-    and corresponding configuration object. Supports both native solvers (Euler, Heun)
-    and Diffrax solvers with different feature sets and performance characteristics.
-
-    The preparation process optimizes the model for efficient execution by pre-compiling
-    closures, pre-allocating buffers, and structuring data for JAX transformations.
+    Builds per-dispatch data (coupling buffers, noise samples, external
+    inputs) and returns ``(solve_fn, config)`` where ``solve_fn(config)``
+    runs the integration. Dispatches on the first two arguments via
+    ``plum``: ``Network``/``AbstractDynamics`` paired with
+    ``NativeSolver``/``DiffraxSolver``.
 
     Parameters
     ----------
-    network : Network
-        Network dynamics model containing:
-
-        - **dynamics** : Neural mass/population model (e.g., ReducedWongWang, JansenRit)
-        - **couplings** : Inter-region coupling functions (can be delayed or instantaneous)
-        - **graph** : Connectivity structure (weights, delays, distances)
-        - **noise** : Optional stochastic process (additive/multiplicative)
-        - **externals** : Optional external inputs (e.g., stimulation)
-
-    solver : NativeSolver or DiffraxSolver
-        Integration method. Two solver families available:
-
-        **NativeSolver** (Euler, Heun):
-            - Fixed time step integration
-            - Supports **all features**: delays, noise, stateful operations
-            - Optimized for jax.lax.scan
-            - Best for most brain network simulations
-
-        **DiffraxSolver** (Tsit5, Dopri5, etc.):
-            - Adaptive time stepping
-            - **Stateless only**: no delayed coupling, no history buffers
-            - Useful for stiff ODEs or when adaptive stepping is required
-            - Raises ValueError if network has delays
-
-    t0 : float, optional
-        Simulation start time, by default 0.0
-    t1 : float, optional
-        Simulation end time, by default 1.0
-    dt : float, optional
-        Integration time step, by default 0.1
-
-        - For NativeSolver: Fixed step size used throughout simulation
-        - For DiffraxSolver: Initial step size (dt0) for adaptive controller
+    t0, t1, dt : float
+        Integration interval and step size. ``dt`` is the fixed step for
+        native solvers and the initial step for Diffrax.
 
     Returns
     -------
-    solve_function : Callable
-        Pure JAX function for running simulation.
+    (Callable, Bunch)
+        Pure solve function and its runtime configuration PyTree.
 
-        Signature: ``solve_function(config) -> results``
-
-        The function is JIT-compiled and supports:
-
-        - Automatic differentiation (jax.grad, jax.jacobian)
-        - Vectorization (jax.vmap)
-        - Parallel execution (jax.pmap)
-
-    config : Bunch
-        Configuration PyTree containing:
-
-        - **dynamics** : Dynamics model parameters
-        - **coupling** : Coupling parameters (one entry per coupling)
-        - **external** : External input parameters (one entry per input)
-        - **noise** : Noise parameters (if stochastic)
-        - **graph** : Graph structure (weights, delays)
-        - **initial_state** : Initial conditions [n_states, n_nodes]
-        - **_internal** : Precomputed data (coupling indices, noise samples, etc.)
-
-    Raises
-    ------
-    ValueError
-        If using DiffraxSolver with delayed coupling (network.max_delay > 0).
-        Diffrax solvers cannot maintain history buffers due to internal loop control.
-
-    Examples
-    --------
-    **Basic Usage with Native Solver**
-
-    >>> from tvboptim.experimental.network_dynamics import Network, prepare
-    >>> from tvboptim.experimental.network_dynamics.dynamics import ReducedWongWang
-    >>> from tvboptim.experimental.network_dynamics.solvers import Euler
-    >>> from tvboptim.experimental.network_dynamics.coupling import LinearCoupling
-    >>> from tvboptim.experimental.network_dynamics.graph import DenseGraph
-    >>> import jax.numpy as jnp
-    >>>
-    >>> # Create network components
-    >>> dynamics = ReducedWongWang()
-    >>> coupling = LinearCoupling(incoming_states='S', G=1.0)
-    >>> weights = jnp.ones((68, 68))  # 68 brain regions
-    >>> graph = DenseGraph(weights)
-    >>>
-    >>> # Build network
-    >>> network = Network(dynamics, coupling, graph)
-    >>>
-    >>> # Prepare for simulation
-    >>> model_fn, config = prepare(network, Euler(), t0=0, t1=100, dt=0.1)
-    >>>
-    >>> # Run simulation
-    >>> results = model_fn(config)
-    >>> print(results.data.shape)  # [n_timesteps, n_voi, n_nodes]
-
-    **With Delayed Coupling (Native Solver Only)**
-
-    >>> from tvboptim.experimental.network_dynamics.coupling import DelayedLinearCoupling
-    >>> from tvboptim.experimental.network_dynamics.graph import DenseDelayGraph
-    >>>
-    >>> # Create graph with heterogeneous delays
-    >>> delays = jnp.array([...])  # [n_nodes, n_nodes] delay matrix in ms
-    >>> graph = DenseDelayGraph(weights, delays)
-    >>>
-    >>> # Delayed coupling requires history buffer
-    >>> coupling = DelayedLinearCoupling(incoming_states='S', G=2.0)
-    >>> network = Network(dynamics, coupling, graph)
-    >>>
-    >>> # Only NativeSolver supports delays
-    >>> model_fn, config = prepare(network, Euler(), t0=0, t1=100, dt=0.1)
-
-    **With Adaptive Stepping (Diffrax Solver)**
-
-    >>> from tvboptim.experimental.network_dynamics.solvers import DiffraxSolver
-    >>> import diffrax
-    >>>
-    >>> # Diffrax solver with adaptive time stepping
-    >>> solver = DiffraxSolver(
-    ...     diffrax.Tsit5(),
-    ...     saveat=diffrax.SaveAt(ts=jnp.arange(0, 100, 0.1))
-    ... )
-    >>>
-    >>> # Network must NOT have delays for Diffrax
-    >>> network = Network(dynamics, LinearCoupling(...), graph)
-    >>> model_fn, config = prepare(network, solver, t0=0, t1=100, dt=0.1)
-    >>> solution = model_fn(config)  # Returns diffrax.Solution object
-
-    **With Stochastic Dynamics**
-
-    >>> from tvboptim.experimental.network_dynamics.noise import AdditiveNoise
-    >>> import jax
-    >>>
-    >>> # Add noise to network
-    >>> noise = AdditiveNoise(state_indices=[0], sigma=0.01, key=jax.random.PRNGKey(0))
-    >>> network = Network(dynamics, coupling, graph, noise=noise)
-    >>>
-    >>> # Prepare with noise (pre-generates noise samples)
-    >>> model_fn, config = prepare(network, Euler(), t0=0, t1=100, dt=0.1)
-
-    **Modifying Parameters**
-
-    >>> # Config is a PyTree - parameters can be modified
-    >>> import copy
-    >>> config_modified = copy.deepcopy(config)
-    >>> config_modified.dynamics.G = 2.5  # Change global coupling
-    >>> config_modified.coupling.default.G = 1.5  # Change coupling strength
-    >>>
-    >>> # Run with modified parameters
-    >>> results_modified = model_fn(config_modified)
-
-    Notes
-    -----
-    **Preparation Steps (NativeSolver):**
-
-    1. Prepare all couplings (create history buffers for delays if needed)
-    2. Build config structure with flattened parameters and graph
-    3. Pre-generate noise samples if stochastic (one sample per timestep)
-    4. Pre-compile coupling computation closures (avoid dict lookups in scan)
-    5. Pre-compile state update closures (for history buffer management)
-    6. Return pure function optimized for jax.lax.scan
-
-    **Preparation Steps (DiffraxSolver):**
-
-    1. Validate network has no delays (raises ValueError if found)
-    2. Prepare stateless coupling/external input data
-    3. Build config with parameters and precomputed data
-    4. Create Diffrax vector field and control term (for SDEs)
-    5. Return pure function wrapping diffrax.diffeqsolve
-
-    **Solver Selection Guidelines:**
-
-    Use **NativeSolver** (Euler, Heun) when:
-
-    - Network has delayed coupling
-    - Need full control over integration loop
-    - Want optimal performance with jax.lax.scan
-    - Standard brain network simulation
-
-    Use **DiffraxSolver** when:
-
-    - Network has no delays (stateless)
-    - Need adaptive time stepping for stiff systems
-    - Want access to advanced Diffrax features
-    - Require error control and step size adaptation
-
-    **Performance Notes:**
-
-    - Native solvers use jax.lax.scan for optimal compile-time optimization
-    - Pre-compilation of closures eliminates runtime overhead
-    - History buffers for delays use efficient circular indexing
-    - Noise samples are pre-generated to avoid per-step RNG calls
-
-    See Also
-    --------
-    solve : High-level interface that calls prepare() and executes immediately
-    Network : Network dynamics model container
-    NativeSolver : Fixed-step integration methods (Euler, Heun)
-    DiffraxSolver : Adaptive-step integration using Diffrax library
+    See ``help(prepare)`` or ``prepare.__doc__`` for the full reference,
+    including per-dispatch parameters (``n_nodes``, ``noise``, ``externals``
+    for bare dynamics) and Diffrax limitations (no delays, no auxiliaries,
+    no VOI filtering).
     """
     # =========================================================================
     # VALIDATION: Check for unsupported features
@@ -836,14 +873,16 @@ def prepare(
     # Prepare all external inputs (get read-only data, ignore state)
     external_data_dict, _ = network.prepare_external(dt)
 
-    # Build config structure
+    # Build config structure. Param/graph subtrees are snapshotted so user
+    # mutations to the returned config don't leak back into the source
+    # network (or contaminate later prepare() calls).
     config = Bunch(
         # Parameters
-        dynamics=network.dynamics.params,
+        dynamics=_snapshot(network.dynamics.params),
         coupling=Bunch(),
         external=Bunch(),
         # Graph
-        graph=network.graph,
+        graph=_snapshot(network.graph),
         # Initial state [n_states, n_nodes]
         initial_state=network.initial_state,
         # Internal data
@@ -855,16 +894,16 @@ def prepare(
     )
 
     # Add coupling params
-    for name, coupling in network.couplings.items():
-        config.coupling[name] = coupling.params
+    for name, coupling in network.coupling.items():
+        config.coupling[name] = _snapshot(coupling.params)
 
     # Add external input params
     for name, external in network.externals.items():
-        config.external[name] = external.params
+        config.external[name] = _snapshot(external.params)
 
     # Add noise params if present
     if network.noise is not None:
-        config.noise = network.noise.params
+        config.noise = _snapshot(network.noise.params)
 
     # =========================================================================
     # PRE-COMPILE COUPLING COMPUTATION CLOSURE
@@ -873,25 +912,25 @@ def prepare(
     # Build coupling list for fast iteration (avoid dict lookups in vector field)
     coupling_list = []
     for name in network.dynamics.COUPLING_INPUTS.keys():
-        if name in network.couplings:
-            coupling = network.couplings[name]
+        if name in network.coupling:
+            coupling = network.coupling[name]
             data = coupling_data_dict[name]
             coupling_list.append((name, coupling, data))
         else:
             coupling_list.append((name, None, None))
 
     n_nodes = network.graph.n_nodes
-    graph = network.graph
 
-    def compute_all_couplings(t, network_state, config):
+    def compute_all_couplings(t, network_state, config, coupling_data_dict):
         """Compute all coupling inputs (stateless - no coupling state).
 
         Args:
             config: Config containing coupling parameters to use
+            coupling_data_dict: Per-coupling data (enriched by precompute if applicable)
         """
         coupling_inputs = Bunch()
 
-        for name, coupling, data in coupling_list:
+        for name, coupling, _ in coupling_list:
             if coupling is None:
                 # Missing coupling - use zeros
                 n_dims = network.dynamics.COUPLING_INPUTS[name]
@@ -899,12 +938,30 @@ def prepare(
             else:
                 # Compute coupling (stateless - pass empty state)
                 # For stateless couplings, coupling_state should be ignored
+                data = coupling_data_dict[name]
                 empty_state = Bunch()
                 coupling_inputs[name] = coupling.compute(
-                    t, network_state, data, empty_state, config.coupling[name], graph
+                    t,
+                    network_state,
+                    data,
+                    empty_state,
+                    config.coupling[name],
+                    config.graph,
                 )
 
         return coupling_inputs
+
+    def precompute_all_couplings(config):
+        """Call precompute() for each coupling. Runs inside JIT, once per forward pass."""
+        enriched = {}
+        for name, coupling, static_data in coupling_list:
+            if coupling is not None:
+                enriched[name] = coupling.precompute(
+                    static_data, config.coupling[name], config.graph
+                )
+            else:
+                enriched[name] = None
+        return enriched
 
     # =========================================================================
     # PRE-COMPILE EXTERNAL INPUT COMPUTATION CLOSURE
@@ -943,112 +1000,45 @@ def prepare(
         return external_inputs
 
     # =========================================================================
-    # CREATE DIFFRAX ODETerm WRAPPER (Drift)
+    # DYNAMICS REFERENCES (captured statically for closures)
     # =========================================================================
 
     dynamics_fn = network.dynamics.dynamics
     n_states = network.dynamics.N_STATES
 
-    def vector_field(t, y, args):
-        """Diffrax-compatible vector field: f(t, y, args) -> dy/dt.
-
-        Args:
-            t: Current time
-            y: Network state [n_states, n_nodes]
-            args: Not used (params are in closure)
-
-        Returns:
-            derivatives: [n_states, n_nodes]
-        """
-        # Compute coupling inputs
-        coupling_inputs = compute_all_couplings(t, y, config)
-
-        # Compute external inputs
-        external_inputs = compute_all_externals(t, y, config)
-
-        # Call dynamics
-        result = dynamics_fn(t, y, config.dynamics, coupling_inputs, external_inputs)
-
-        # Extract derivatives (discard auxiliaries if present)
-        if isinstance(result, tuple):
-            derivatives, _ = result
-        else:
-            derivatives = result
-
-        return derivatives
-
     # =========================================================================
-    # CREATE DIFFRAX ControlTerm WRAPPER (Diffusion) if noise present
+    # DIFFUSION HELPER (outside _f — captures only static objects)
     # =========================================================================
 
-    diffusion_term = None
-    if network.noise is not None:
-        # Get noise configuration
+    has_noise = network.noise is not None
+    brownian_tol = None
+    n_brownian = None
+    if has_noise:
         noise_state_indices = network.noise._state_indices
         n_noise_states = len(noise_state_indices)
-
-        def diffusion_vector_field(t, y, args):
-            """Diffusion coefficient g(t, y) for ControlTerm.
-
-            Args:
-                t: Current time
-                y: Network state [n_states, n_nodes]
-                args: Not used (params are in closure)
-
-            Returns:
-                Diffusion matrix [n_states, n_nodes, n_brownian]
-                where n_brownian = n_noise_states * n_nodes
-            """
-            # Compute diffusion coefficients using noise model
-            g_raw = network.noise.diffusion(t, y, config.noise)
-
-            # Handle different return types from diffusion():
-            # - Scalar (e.g., AdditiveNoise with constant sigma)
-            # - Array [n_noise_states, n_nodes] (e.g., MultiplicativeNoise)
-
-            # Ensure g has shape [n_noise_states, n_nodes]
-            if jnp.ndim(g_raw) == 0:
-                # Scalar - broadcast to all noise states and nodes
-                g = jnp.full((n_noise_states, n_nodes), g_raw)
-            elif jnp.ndim(g_raw) == 1:
-                # 1D array - could be per-state or per-node, assume broadcasting needed
-                g = jnp.broadcast_to(g_raw[..., None], (n_noise_states, n_nodes))
-            else:
-                # Already [n_noise_states, n_nodes]
-                g = g_raw
-
-            # Build full diffusion matrix that maps Brownian motion to state space
-            # Shape: [n_states, n_nodes, n_brownian]
-            # where n_brownian = n_noise_states * n_nodes
-            n_brownian = n_noise_states * n_nodes
-
-            # Initialize with zeros
-            diffusion_matrix = jnp.zeros((n_states, n_nodes, n_brownian))
-
-            # Fill in the diagonal blocks for states that receive noise
-            for i, state_idx in enumerate(noise_state_indices):
-                for j in range(n_nodes):
-                    # This Brownian dimension corresponds to state_idx, node j
-                    brownian_idx = i * n_nodes + j
-                    # Set the diffusion coefficient
-                    diffusion_matrix = diffusion_matrix.at[
-                        state_idx, j, brownian_idx
-                    ].set(g[i, j])
-
-            return diffusion_matrix
-
-        # Create Brownian motion
         n_brownian = n_noise_states * n_nodes
-        brownian_motion = diffrax.VirtualBrownianTree(
-            t0=t0,
-            t1=t1,
-            tol=dt * 0.01,  # Brownian tree tolerance (finer than dt)
-            shape=(n_brownian,),
-            key=network.noise.key,
+        brownian_tol = dt * 0.01
+
+        compute_diffusion_matrix = _make_diffusion_matrix_fn(
+            network.noise.diffusion, noise_state_indices, n_states, n_nodes
         )
 
-        # Create diffusion term
-        diffusion_term = diffrax.ControlTerm(diffusion_vector_field, brownian_motion)
+        # Expose the PRNG key on the config so callers can swap seeds per
+        # call (mirroring the native dispatch). The VirtualBrownianTree is
+        # rebuilt inside _f from config.noise.key — see the rationale below.
+        config.noise.key = network.noise.key
+
+    # =========================================================================
+    # COMPUTE EFFECTIVE SAVE DT FROM SAVEAT
+    # =========================================================================
+    # Infer the effective output dt from saveat.ts if available (ts-based saveat).
+    # This is a Python-level computation done once at prepare time, so it is
+    # concrete and usable as static data in monitors (int/round patterns, etc.).
+    # None signals that dt cannot be determined; monitors must handle this case.
+    effective_save_dt = None
+    saveat_ts = getattr(getattr(solver.saveat, "subs", solver.saveat), "ts", None)
+    if saveat_ts is not None and len(saveat_ts) > 1:
+        effective_save_dt = float(saveat_ts[1] - saveat_ts[0])
 
     # =========================================================================
     # CREATE SOLVE FUNCTION
@@ -1056,12 +1046,57 @@ def prepare(
 
     def _f(config):
         """Pure integration function using Diffrax."""
+        # Run precompute() for all couplings once before the solve.
+        # This allows parameter-dependent quantities (e.g. W_eff = W * wLRE) to
+        # be computed with gradient flow while avoiding per-step redundancy.
+        enriched = precompute_all_couplings(config)
+
+        def vector_field(t, y, args):
+            """Diffrax-compatible vector field: f(t, y, args) -> dy/dt."""
+            # Compute coupling inputs using enriched (precomputed) data
+            coupling_inputs = compute_all_couplings(t, y, config, enriched)
+
+            # Compute external inputs
+            external_inputs = compute_all_externals(t, y, config)
+
+            # Call dynamics
+            result = dynamics_fn(
+                t, y, config.dynamics, coupling_inputs, external_inputs
+            )
+
+            # Extract derivatives (discard auxiliaries if present)
+            if isinstance(result, tuple):
+                derivatives, _ = result
+            else:
+                derivatives = result
+
+            return derivatives
+
         # Create drift term (deterministic dynamics)
         drift_term = diffrax.ODETerm(vector_field)
 
         # Combine terms
-        if diffusion_term is not None:
-            # SDE: combine drift and diffusion
+        if has_noise:
+            # Rebuild the VirtualBrownianTree inside _f so the PRNG key is
+            # drawn from the runtime config rather than captured as a
+            # closure variable. This lets callers swap config.noise.key
+            # per call (e.g. via eqx.tree_at + jax.vmap) without
+            # re-`prepare`-ing the entire solve function.
+            brownian_motion = diffrax.VirtualBrownianTree(
+                t0=t0,
+                t1=t1,
+                tol=brownian_tol,
+                shape=(n_brownian,),
+                key=config.noise.key,
+            )
+
+            # SDE: build diffusion term inside _f so it uses runtime config
+            def diffusion_vector_field(t, y, args):
+                return compute_diffusion_matrix(t, y, config.noise)
+
+            diffusion_term = diffrax.ControlTerm(
+                diffusion_vector_field, brownian_motion
+            )
             terms = diffrax.MultiTerm(drift_term, diffusion_term)
         else:
             # ODE: just drift
@@ -1086,6 +1121,427 @@ def prepare(
         #   finite_mask = jnp.isfinite(solution.ts)
         #   solution_filtered = solution.ts[finite_mask], solution.ys[finite_mask]
 
-        return solution
+        return DiffraxSolution(
+            solution,
+            dt=effective_save_dt,
+            variable_names=tuple(network.dynamics.STATE_NAMES),
+        )
 
     return _f, config
+
+
+@dispatch
+def prepare(
+    dynamics: AbstractDynamics,
+    solver: NativeSolver,
+    t0: float = 0.0,
+    t1: float = 1.0,
+    dt: float = 0.1,
+    n_nodes: int = 1,
+    noise=None,
+    externals=None,
+) -> Tuple[Callable, Bunch]:
+    """Compile a model into a pure JAX solve function and a config PyTree.
+
+    Builds per-dispatch data (coupling buffers, noise samples, external
+    inputs) and returns ``(solve_fn, config)`` where ``solve_fn(config)``
+    runs the integration. Dispatches on the first two arguments via
+    ``plum``: ``Network``/``AbstractDynamics`` paired with
+    ``NativeSolver``/``DiffraxSolver``.
+
+    Parameters
+    ----------
+    t0, t1, dt : float
+        Integration interval and step size. ``dt`` is the fixed step for
+        native solvers and the initial step for Diffrax.
+
+    Returns
+    -------
+    (Callable, Bunch)
+        Pure solve function and its runtime configuration PyTree.
+
+    See ``help(prepare)`` or ``prepare.__doc__`` for the full reference,
+    including per-dispatch parameters (``n_nodes``, ``noise``, ``externals``
+    for bare dynamics) and Diffrax limitations (no delays, no auxiliaries,
+    no VOI filtering).
+    """
+    # Initial state [N_STATES, n_nodes]
+    state0 = dynamics.get_default_initial_state(n_nodes)
+
+    # Zero coupling (always — bare dynamics has no coupling)
+    zero_coupling = Bunch()
+    for name, n_dims in dynamics.COUPLING_INPUTS.items():
+        zero_coupling[name] = jnp.zeros((n_dims, n_nodes))
+
+    # Time array
+    time_steps = jnp.arange(t0, t1, dt)
+    n_steps = len(time_steps)
+
+    # Config. Param subtrees are snapshotted so user mutations to the
+    # returned config don't leak back into the source dynamics/noise/externals.
+    config = Bunch(
+        dynamics=_snapshot(dynamics.params),
+        initial_state=state0,
+        _internal=Bunch(time=Bunch(t0=t0, t1=t1, dt=dt)),
+    )
+
+    # ---- Noise setup ----
+    # Noise increments are materialised inside _f via a single
+    # jax.random.normal(config.noise.key, ...) call, which XLA fuses
+    # with the downstream scan. Users can override by populating
+    # config._internal.noise_samples with a pre-sampled trajectory; the
+    # scan branches on its presence at trace time.
+    has_noise = noise is not None
+    if has_noise:
+        noise._state_indices = noise._resolve_state_indices(dynamics)
+        noise_state_indices = noise._state_indices
+        config.noise = _snapshot(noise.params)
+        config.noise.key = noise.key
+        config._internal.noise_samples = None
+        n_noise_states = len(noise_state_indices)
+        noise_diffusion = noise.diffusion
+
+    # ---- External inputs setup ----
+    has_externals = externals is not None and len(externals) > 0
+    if has_externals:
+        config.external = Bunch()
+        external_list = []
+        external_data_dict = Bunch()
+        external_state_dict_init = Bunch()
+
+        for name in dynamics.EXTERNAL_INPUTS.keys():
+            if name in externals:
+                ext_obj = externals[name]
+                config.external[name] = _snapshot(ext_obj.params)
+                # Pass None as network — parametric externals don't use it
+                ext_data, ext_state = ext_obj.prepare(None, dt)
+                external_data_dict[name] = ext_data
+                external_state_dict_init[name] = ext_state
+                external_list.append((name, ext_obj, ext_data))
+            else:
+                external_list.append((name, None, None))
+
+        config._internal.external = external_data_dict
+        config.initial_state = Bunch(
+            dynamics=state0,
+            external=external_state_dict_init,
+        )
+
+        def compute_all_externals(t, state, external_state_dict, config):
+            external_inputs = Bunch()
+            for name, ext_obj, data in external_list:
+                if ext_obj is None:
+                    n_dims = dynamics.EXTERNAL_INPUTS[name]
+                    external_inputs[name] = jnp.zeros((n_dims, n_nodes))
+                else:
+                    state_data = external_state_dict[name]
+                    external_inputs[name] = ext_obj.compute(
+                        t, state, data, state_data, config.external[name]
+                    )
+            return external_inputs
+
+        def update_all_external_states(external_state_dict, new_state):
+            new_states = Bunch()
+            for name, ext_obj, data in external_list:
+                if ext_obj is not None:
+                    new_states[name] = ext_obj.update_state(
+                        data, external_state_dict[name], new_state
+                    )
+            return new_states
+    else:
+        # Zero external inputs
+        zero_external = Bunch()
+        for name, n_dims in dynamics.EXTERNAL_INPUTS.items():
+            zero_external[name] = jnp.zeros((n_dims, n_nodes))
+
+    # References
+    dynamics_fn = dynamics.dynamics
+    solver_step = solver.step
+    n_states = dynamics.N_STATES
+
+    # VOI filtering
+    voi_indices = dynamics.get_variables_of_interest_indices()
+    state_voi_indices = jnp.array([i for i in voi_indices if i < n_states], dtype=int)
+    aux_voi_indices = jnp.array(
+        [i - n_states for i in voi_indices if i >= n_states], dtype=int
+    )
+    record_auxiliaries = len(aux_voi_indices) > 0
+
+    # Variable names matching the output layout: selected states, then selected auxiliaries.
+    _all_variable_names = dynamics.all_variable_names
+    variable_names = tuple(
+        _all_variable_names[i] for i in voi_indices if i < n_states
+    ) + tuple(_all_variable_names[i] for i in voi_indices if i >= n_states)
+
+    # Static shape for the full per-call noise tensor.
+    noise_samples_shape = (n_steps, n_noise_states, n_nodes) if has_noise else None
+
+    def _f(config):
+        """Pure integration function for bare dynamics."""
+
+        # Materialize the full noise trajectory once per call. See the
+        # network+native dispatch for the rationale; the trace-time branch
+        # on the injection slot keeps both seed-scan and explicit-replay
+        # workflows on the same scan body.
+        if has_noise:
+            if config._internal.noise_samples is None:
+                noise_samples_all = jax.random.normal(
+                    config.noise.key, noise_samples_shape
+                )
+            else:
+                noise_samples_all = config._internal.noise_samples
+        else:
+            noise_samples_all = None
+
+        def op(carry, scan_input):
+            t = scan_input[0]
+            step_idx = scan_input[1].astype(int)
+
+            # Unpack carry
+            if has_externals:
+                state = carry.dynamics
+                external_state_dict = carry.external
+            else:
+                state = carry
+
+            def wrapped_dynamics(t_inner, s, params):
+                if has_externals:
+                    ext_inputs = compute_all_externals(
+                        t_inner, s, external_state_dict, config
+                    )
+                else:
+                    ext_inputs = zero_external
+                return dynamics_fn(t_inner, s, params, zero_coupling, ext_inputs)
+
+            # Noise: single indexed read into the per-call tensor.
+            if has_noise:
+                noise_raw = noise_samples_all[step_idx]
+                diffusion = noise_diffusion(t, state, config.noise)
+                scaled_noise = diffusion * jnp.sqrt(dt) * noise_raw
+                noise_sample = jnp.zeros_like(state)
+                noise_sample = noise_sample.at[noise_state_indices].set(scaled_noise)
+            else:
+                noise_sample = jnp.zeros_like(state)
+
+            next_state, auxiliaries = solver_step(
+                wrapped_dynamics, t, state, dt, config.dynamics, noise_sample
+            )
+
+            # VOI filtering
+            if len(state_voi_indices) > 0:
+                selected_states = next_state[state_voi_indices]
+            else:
+                selected_states = jnp.array([]).reshape(0, next_state.shape[1])
+
+            if record_auxiliaries and auxiliaries.size > 0:
+                selected_aux = auxiliaries[aux_voi_indices]
+                output = jnp.concatenate([selected_states, selected_aux], axis=0)
+            else:
+                output = selected_states
+
+            # Update carry
+            if has_externals:
+                next_external = update_all_external_states(
+                    external_state_dict, next_state
+                )
+                next_carry = Bunch(dynamics=next_state, external=next_external)
+            else:
+                next_carry = next_state
+
+            return next_carry, output
+
+        scan_inputs = jnp.stack(
+            [time_steps, jnp.arange(n_steps, dtype=time_steps.dtype)], axis=1
+        )
+        # See the Network+Native dispatch for the rationale on the branch.
+        if solver.checkpoint_every is None:
+            _, res = jax.lax.scan(op, config.initial_state, scan_inputs)
+        else:
+            _, res = _checkpointed_scan(
+                op,
+                config.initial_state,
+                scan_inputs,
+                n_steps,
+                solver.checkpoint_every,
+            )
+        return wrap_native_result(res, t0, t1, dt, variable_names=variable_names)
+
+    return _f, config
+
+
+@dispatch
+def prepare(
+    dynamics: AbstractDynamics,
+    solver: DiffraxSolver,
+    t0: float = 0.0,
+    t1: float = 1.0,
+    dt: float = 0.1,
+    n_nodes: int = 1,
+    noise=None,
+    externals=None,
+) -> Tuple[Callable, Bunch]:
+    """Compile a model into a pure JAX solve function and a config PyTree.
+
+    Builds per-dispatch data (coupling buffers, noise samples, external
+    inputs) and returns ``(solve_fn, config)`` where ``solve_fn(config)``
+    runs the integration. Dispatches on the first two arguments via
+    ``plum``: ``Network``/``AbstractDynamics`` paired with
+    ``NativeSolver``/``DiffraxSolver``.
+
+    Parameters
+    ----------
+    t0, t1, dt : float
+        Integration interval and step size. ``dt`` is the fixed step for
+        native solvers and the initial step for Diffrax.
+
+    Returns
+    -------
+    (Callable, Bunch)
+        Pure solve function and its runtime configuration PyTree.
+
+    See ``help(prepare)`` or ``prepare.__doc__`` for the full reference,
+    including per-dispatch parameters (``n_nodes``, ``noise``, ``externals``
+    for bare dynamics) and Diffrax limitations (no delays, no auxiliaries,
+    no VOI filtering).
+    """
+    # Initial state [N_STATES, n_nodes]
+    state0 = dynamics.get_default_initial_state(n_nodes)
+
+    # Zero coupling (always)
+    zero_coupling = Bunch()
+    for name, n_dims in dynamics.COUPLING_INPUTS.items():
+        zero_coupling[name] = jnp.zeros((n_dims, n_nodes))
+
+    # Config. Param subtrees are snapshotted so user mutations to the
+    # returned config don't leak back into the source dynamics/noise/externals.
+    config = Bunch(
+        dynamics=_snapshot(dynamics.params),
+        initial_state=state0,
+        _internal=Bunch(time=Bunch(t0=t0, t1=t1, dt=dt)),
+    )
+
+    # References
+    dynamics_fn = dynamics.dynamics
+    n_states = dynamics.N_STATES
+
+    # ---- Noise setup ----
+    has_noise = noise is not None
+    brownian_tol = None
+    n_brownian = None
+    if has_noise:
+        noise._state_indices = noise._resolve_state_indices(dynamics)
+        noise_state_indices = noise._state_indices
+        config.noise = _snapshot(noise.params)
+        config.noise.key = noise.key
+        n_noise_states = len(noise_state_indices)
+        n_brownian = n_noise_states * n_nodes
+        brownian_tol = dt * 0.01
+
+        compute_diffusion_matrix = _make_diffusion_matrix_fn(
+            noise.diffusion, noise_state_indices, n_states, n_nodes
+        )
+
+    # ---- External inputs setup ----
+    has_externals = externals is not None and len(externals) > 0
+    if has_externals:
+        config.external = Bunch()
+        external_list = []
+        external_data_dict = Bunch()
+
+        for name in dynamics.EXTERNAL_INPUTS.keys():
+            if name in externals:
+                ext_obj = externals[name]
+                config.external[name] = _snapshot(ext_obj.params)
+                ext_data, _ = ext_obj.prepare(None, dt)
+                external_data_dict[name] = ext_data
+                external_list.append((name, ext_obj, ext_data))
+            else:
+                external_list.append((name, None, None))
+
+        config._internal.external = external_data_dict
+
+        def compute_all_externals(t, state, config):
+            external_inputs = Bunch()
+            for name, ext_obj, data in external_list:
+                if ext_obj is None:
+                    n_dims = dynamics.EXTERNAL_INPUTS[name]
+                    external_inputs[name] = jnp.zeros((n_dims, n_nodes))
+                else:
+                    empty_state = Bunch()
+                    external_inputs[name] = ext_obj.compute(
+                        t, state, data, empty_state, config.external[name]
+                    )
+            return external_inputs
+    else:
+        zero_external = Bunch()
+        for name, n_dims in dynamics.EXTERNAL_INPUTS.items():
+            zero_external[name] = jnp.zeros((n_dims, n_nodes))
+
+    # Effective save dt from saveat
+    effective_save_dt = None
+    saveat_ts = getattr(getattr(solver.saveat, "subs", solver.saveat), "ts", None)
+    if saveat_ts is not None and len(saveat_ts) > 1:
+        effective_save_dt = float(saveat_ts[1] - saveat_ts[0])
+
+    def _f(config):
+        """Pure integration function using Diffrax for bare dynamics."""
+
+        def vector_field(t, y, args):
+            if has_externals:
+                ext_inputs = compute_all_externals(t, y, config)
+            else:
+                ext_inputs = zero_external
+            result = dynamics_fn(t, y, config.dynamics, zero_coupling, ext_inputs)
+            if isinstance(result, tuple):
+                derivatives, _ = result
+            else:
+                derivatives = result
+            return derivatives
+
+        drift_term = diffrax.ODETerm(vector_field)
+
+        if has_noise:
+            # Rebuild the VirtualBrownianTree per call so it draws its key
+            # from config.noise.key — see the Network+Diffrax dispatch for
+            # the rationale.
+            brownian_motion = diffrax.VirtualBrownianTree(
+                t0=t0,
+                t1=t1,
+                tol=brownian_tol,
+                shape=(n_brownian,),
+                key=config.noise.key,
+            )
+
+            def diffusion_vector_field(t, y, args):
+                return compute_diffusion_matrix(t, y, config.noise)
+
+            diffusion_term = diffrax.ControlTerm(
+                diffusion_vector_field, brownian_motion
+            )
+            terms = diffrax.MultiTerm(drift_term, diffusion_term)
+        else:
+            terms = drift_term
+
+        solution = diffrax.diffeqsolve(
+            terms,
+            solver.solver,
+            t0=t0,
+            t1=t1,
+            dt0=dt,
+            y0=config.initial_state,
+            saveat=solver.saveat,
+            stepsize_controller=solver.stepsize_controller,
+            max_steps=solver.max_steps,
+            **solver.diffrax_kwargs,
+        )
+
+        return DiffraxSolution(
+            solution,
+            dt=effective_save_dt,
+            variable_names=tuple(dynamics.STATE_NAMES),
+        )
+
+    return _f, config
+
+
+prepare.__doc__ = _PREPARE_DOC
