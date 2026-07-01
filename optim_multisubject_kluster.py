@@ -10,16 +10,21 @@ from pathlib import Path
 from utils import *
 from model_definition.network_model_utils import *
 from tvboptim.types import Parameter, BoundedParameter
+# Import the HRF kernels to test different ones as a parameter
+from tvboptim.observations.tvb_monitors.bold import FirstOrderVolterraHRFKernel, GammaHRFKernel, DoubleExponentialHRFKernel, MixtureOfGammasHRFKernel
+
 
 jax.config.update("jax_enable_x64", True)
 
 ## Set params ====================
 # Set directory information
 data_dir = "./"
+result_dir = "D:/Cogmaster/M2/stage/results/TVBOptim_RWW"
+os.makedirs(result_dir, exist_ok=True)
+
+# Set file names for the two conditions
 cond0_filename = "TS_Control.npy"
 cond1_filename = "TS_Schizo.npy"
-result_dir = "./results/"
-os.makedirs(result_dir, exist_ok=True)
 
 # Set dataset parameters
 n_sub = 48
@@ -33,6 +38,8 @@ dt = 4.0      # Integration timestep (ms) matching original script
 bold_TR = 2000.0 # BOLD sampling period (ms)
 transient_lim = 5 # Number of time points to remove as transient (transient_lim * dt ms)
 target_fic = 0.25  # FIC tuning parameter: Target excitatory activity level
+kernel = GammaHRFKernel()  # HRF kernel for BOLD simulation
+kernel_name = kernel.__class__.__name__
 
 # Gradient descent parameters
 learning_rate = 0.0325
@@ -85,7 +92,7 @@ network = build_network_model(weights=weights, labels=labels, sigma=sigma)
 
 ## Run initial simulation and set up BOLD monitor ======================
 model, state, result_init = run_initial_simulation(t1=t1, dt=dt, network=network)
-bold_monitor_opt = setup_bold_monitor(bold_TR = bold_TR, result_init = result_init)
+bold_monitor_opt = setup_bold_monitor(bold_TR = bold_TR, result_init = result_init, kernel = kernel)
 network.update_history(result_init)
 model_opt, state_opt, _ = run_initial_simulation(t1=t1, dt=dt, network = network, verbose=False)
 
@@ -101,7 +108,7 @@ Q0_pre_gd, Q1_pre_gd = eval_Q0_Q1(
 
 ## Main pipeline ========================
 # Test for scaling up - later substitute with n_sub and n_cond defined at the beggining of script
-n_sub_test = 1
+n_sub_test = 15
 n_cond_test = 2
 
 # Define ranges for participants and conditions for testing
@@ -146,7 +153,7 @@ for participant_idx in participant_range_test:
 ## Save results =====================
 
 # Create a folder in the results directory with the learning rate and max steps information
-run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_nsub_{n_sub_test}_sigma_{sigma}_zscore_True_diagZero_False_diagZeroQ0_False")
+run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_nsub_{n_sub_test}_sigma_{sigma}_kernel_{kernel_name}")
 os.makedirs(run_dir, exist_ok=True)
 
 # Save variables to a pickle file with a timestamp in the filename
