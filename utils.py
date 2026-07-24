@@ -62,6 +62,9 @@ def load_and_organize_bold(data_dir: str | None = None,
 
     ## Organize the data
     # Separate the participants by condition
+    assert TS_CTR.shape[0] >= n_sub and TS_SCZ.shape[0] >= n_sub, "Not enough subjects in the provided data files."
+    assert TS_CTR.shape[1] >= n_nodes and TS_SCZ.shape[1] >= n_nodes, "Not enough nodes in the provided data files."
+    assert TS_CTR.ndim == 3 and TS_SCZ.ndim == 3, "Input data must be 3D arrays (subjects, nodes, time points)."
     condition_0 = TS_CTR[0:n_sub, 0:n_nodes, :]  
     condition_1 = TS_SCZ[0:n_sub, 0:n_nodes, :]  
 

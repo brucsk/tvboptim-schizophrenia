@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from typing import Tuple, Callable, Any
+
 from tvboptim.experimental.network_dynamics.graph import DenseGraph
 from model_definition.rww_dynamics import ReducedWongWangEIB
 from model_definition.eib_linear_coupling import EIBLinearCoupling
@@ -11,8 +12,8 @@ from tvboptim.experimental.network_dynamics.solvers import Heun, BoundedSolver
 from tvboptim.experimental.network_dynamics.result import NativeSolution
 from tvboptim.experimental.network_dynamics.core.bunch import Bunch
 
-
-from tvboptim.observations.tvb_monitors.bold import Bold, HRFBold, HRFKernel, FirstOrderVolterraHRFKernel, GammaHRFKernel, DoubleExponentialHRFKernel, MixtureOfGammasHRFKernel
+from tvboptim.observations.tvb_monitors.downsampling import AbstractMonitor
+from tvboptim.observations.tvb_monitors.bold import Bold, HRFBold, BalloonWindkesselBold, HRFKernel, FirstOrderVolterraHRFKernel, GammaHRFKernel, DoubleExponentialHRFKernel, MixtureOfGammasHRFKernel
 
 def build_network_model(weights: np.ndarray, labels: list[str], sigma: float = 0.01, verbose: bool = True) -> Network:  
     """
@@ -87,7 +88,7 @@ def run_initial_simulation(t1: float, dt: float, network: Network, verbose: bool
 
     return model, state, result_init
 
-def setup_bold_monitor(bold_TR: float = 2000.0, result_init: NativeSolution = None, 
+def setup_bold_monitor(bold_TR: float = 2000.0, result_init: NativeSolution = None, monitor_type: AbstractMonitor = HRFBold,
                        kernel: HRFKernel = FirstOrderVolterraHRFKernel(), verbose: bool = True) -> HRFBold:
     """
     Set up a BOLD monitor for the network simulation.
@@ -104,13 +105,20 @@ def setup_bold_monitor(bold_TR: float = 2000.0, result_init: NativeSolution = No
     HRFBold: A configured BOLD monitor for the network simulation.
     """    
     # The BOLD period is bold_TR
-    bold_monitor = HRFBold(
-        period=bold_TR,           # BOLD sampling period (TR = 2000 ms)
-        downsample_period=4.0,  # Intermediate downsampling matches dt
-        voi=0,                  # Monitor first state variable (S_e)
-        history=result_init,     # Use initial state as warm start for BOLD history
-        kernel=kernel 
-    )
+    if monitor_type is HRFBold:
+        bold_monitor = HRFBold(
+            period=bold_TR,           # BOLD sampling period (TR = 2000 ms)
+            downsample_period=4.0,  # Intermediate downsampling matches dt
+            voi=0,                  # Monitor first state variable (S_e)
+            history=result_init,     # Use initial state as warm start for BOLD history
+            kernel=kernel 
+        )
+    elif monitor_type is BalloonWindkesselBold:
+        bold_monitor = BalloonWindkesselBold(
+            period=bold_TR,           # BOLD sampling period (TR = 2000 ms)
+            dt_bw=1.0,              # Internal BW integration step in ms
+            voi=0,                  # Monitor first state variable (S_e)
+        )
 
     if verbose:
         print("BOLD monitor initialized")

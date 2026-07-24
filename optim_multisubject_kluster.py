@@ -11,7 +11,7 @@ from utils import *
 from model_definition.network_model_utils import *
 from tvboptim.types import Parameter, BoundedParameter
 # Import the HRF kernels to test different ones as a parameter
-from tvboptim.observations.tvb_monitors.bold import FirstOrderVolterraHRFKernel, GammaHRFKernel, DoubleExponentialHRFKernel, MixtureOfGammasHRFKernel
+from tvboptim.observations.tvb_monitors.bold import HRFBold, BalloonWindkesselBold, HRFKernel, FirstOrderVolterraHRFKernel, GammaHRFKernel, DoubleExponentialHRFKernel, MixtureOfGammasHRFKernel
 
 
 jax.config.update("jax_enable_x64", True)
@@ -19,7 +19,7 @@ jax.config.update("jax_enable_x64", True)
 ## Set params ====================
 # Set directory information
 data_dir = "./"
-result_dir = "D:/Cogmaster/M2/stage/results/TVBOptim_RWW"
+result_dir = "./results/TVBOptim_RWW/kernel_test/"
 os.makedirs(result_dir, exist_ok=True)
 
 # Set file names for the two conditions
@@ -38,8 +38,13 @@ dt = 4.0      # Integration timestep (ms) matching original script
 bold_TR = 2000.0 # BOLD sampling period (ms)
 transient_lim = 5 # Number of time points to remove as transient (transient_lim * dt ms)
 target_fic = 0.25  # FIC tuning parameter: Target excitatory activity level
-kernel = GammaHRFKernel()  # HRF kernel for BOLD simulation
-kernel_name = kernel.__class__.__name__
+monitor_type = HRFBold # Choose the BOLD monitor type (HRFBold or BalloonWindkesselBold)
+monitor_type_name = monitor_type.__name__
+if monitor_type_name == "HRFBold":
+    kernel =  MixtureOfGammasHRFKernel() # HRF kernel for BOLD simulation
+    kernel_name = kernel.__class__.__name__
+elif monitor_type_name == "BalloonWindkesselBold":
+    kernel = None  # No kernel needed for BalloonWindkesselBold
 
 # Gradient descent parameters
 learning_rate = 0.0325
@@ -92,7 +97,7 @@ network = build_network_model(weights=weights, labels=labels, sigma=sigma)
 
 ## Run initial simulation and set up BOLD monitor ======================
 model, state, result_init = run_initial_simulation(t1=t1, dt=dt, network=network)
-bold_monitor_opt = setup_bold_monitor(bold_TR = bold_TR, result_init = result_init, kernel = kernel)
+bold_monitor_opt = setup_bold_monitor(bold_TR = bold_TR, result_init = result_init, monitor_type = monitor_type, kernel = kernel)
 network.update_history(result_init)
 model_opt, state_opt, _ = run_initial_simulation(t1=t1, dt=dt, network = network, verbose=False)
 
@@ -108,7 +113,7 @@ Q0_pre_gd, Q1_pre_gd = eval_Q0_Q1(
 
 ## Main pipeline ========================
 # Test for scaling up - later substitute with n_sub and n_cond defined at the beggining of script
-n_sub_test = 15
+n_sub_test = 48
 n_cond_test = 2
 
 # Define ranges for participants and conditions for testing
@@ -153,8 +158,12 @@ for participant_idx in participant_range_test:
 ## Save results =====================
 
 # Create a folder in the results directory with the learning rate and max steps information
-run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_nsub_{n_sub_test}_sigma_{sigma}_kernel_{kernel_name}")
+if monitor_type_name == "HRFBold":
+    run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_nsub_{n_sub_test}_sigma_{sigma}_kernel_{kernel_name}")
+elif monitor_type_name == "BalloonWindkesselBold":
+    run_dir = os.path.join(result_dir, f"lr_{learning_rate}_steps_{max_steps}_nsub_{n_sub_test}_sigma_{sigma}_monitor_{monitor_type_name}")
 os.makedirs(run_dir, exist_ok=True)
+print("Saving results to:", run_dir)
 
 # Save variables to a pickle file with a timestamp in the filename
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
