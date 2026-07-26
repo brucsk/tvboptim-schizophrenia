@@ -89,7 +89,7 @@ def run_initial_simulation(t1: float, dt: float, network: Network, verbose: bool
     return model, state, result_init
 
 def setup_bold_monitor(bold_TR: float = 2000.0, result_init: NativeSolution = None, monitor_type: AbstractMonitor = HRFBold,
-                       kernel: HRFKernel = FirstOrderVolterraHRFKernel(), verbose: bool = True) -> HRFBold:
+                       kernel: HRFKernel | None = FirstOrderVolterraHRFKernel(), verbose: bool = True) -> HRFBold:
     """
     Set up a BOLD monitor for the network simulation.
     Parameters

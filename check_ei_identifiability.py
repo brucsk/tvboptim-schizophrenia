@@ -41,6 +41,8 @@ import numpy as np
 import optax
 import pandas as pd
 
+from tvboptim.observations.tvb_monitors.bold import HRFBold, BalloonWindkesselBold, HRFKernel, FirstOrderVolterraHRFKernel, GammaHRFKernel, DoubleExponentialHRFKernel, MixtureOfGammasHRFKernel
+
 from utils import (
     load_and_organize_bold,
     load_structural_connectivity,
@@ -71,15 +73,15 @@ n_cond = len(conds)
 n_nodes = 68
 n_sub_total = 48
 
-N_SUBJECTS_CHECK = 6           # subjects per group used for this check (5-10)
+N_SUBJECTS_CHECK = 48           # subjects per group used for this check (5-10)
 SEED_LIST = list(range(5))     # random seeds per subject
 INIT_JITTER_SD = 0.05          # relative sd of multiplicative jitter on initial wLRE/wFFI
 
 # Simulation / fitting settings -- kept identical to the production pipeline
 # so this check is representative of what group-level fits will look like.
 # NOTE: N_SUBJECTS_CHECK * n_cond * len(SEED_LIST) fits are run below
-# (here: 6*2*5 = 60), each for max_steps optimizer steps, so runtime is
-# comparable to the full 48-subject pipeline. Reduce max_steps for a
+# (here: 48*2*5 = 480), each for max_steps optimizer steps, so runtime is
+# larger than the full 48-subject pipeline. Reduce max_steps for a
 # cheaper/quicker sanity check if needed.
 t1 = 314_000
 dt = 4.0
@@ -93,7 +95,7 @@ alpha_fc0 = 1.0
 beta_fc1 = 2.0
 n_tau = 2
 
-result_dir = "./results/ei_identifiability_check/"
+result_dir = f"./results/ei_identifiability_check_nsub_{N_SUBJECTS_CHECK}/"
 os.makedirs(result_dir, exist_ok=True)
 checkpoint_dir = os.path.join(result_dir, "fits")
 os.makedirs(checkpoint_dir, exist_ok=True)
@@ -135,9 +137,9 @@ print("Building network and running initial transient...")
 network = build_network_model(weights=weights, labels=labels, sigma=sigma)
 _, _, result_init = run_initial_simulation(t1=t1, dt=dt, network=network)
 
-kernel = MixtureOfGammasHRFKernel()
+kernel = None  # No kernel needed for BalloonWindkesselBold
 bold_monitor_opt = setup_bold_monitor(
-    bold_TR=bold_TR, result_init=result_init, monitor_type=HRFBold, kernel=kernel
+    bold_TR=bold_TR, result_init=result_init, monitor_type=BalloonWindkesselBold, kernel=kernel
 )
 network.update_history(result_init)
 model_opt, state_opt, _ = run_initial_simulation(t1=t1, dt=dt, network=network, verbose=False)
